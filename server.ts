@@ -1,0 +1,2570 @@
+import express from 'express';
+import path from 'path';
+import fs from 'fs';
+import dotenv from 'dotenv';
+import crypto from 'crypto';
+import dns from 'dns';
+import { createServer as createViteServer } from 'vite';
+import { createClient, SupabaseClient } from '@supabase/supabase-js';
+
+dotenv.config();
+
+const app = express();
+const PORT = 3000;
+
+// Body parsing middleware (Increased to 100mb for video, image and file uploads)
+app.use(express.json({ limit: '100mb' }));
+app.use(express.urlencoded({ extended: true, limit: '100mb' }));
+
+// Helper to clean API keys
+function sanitizeKey(key?: string): string {
+  if (!key) return '';
+  return key.trim().replace(/^["']|["']$/g, '').replace(/[\r\n\t\s]+/g, '');
+}
+
+// In-memory cache for tracking last backup metadata
+let inMemoryLastBackup: any = null;
+let supabaseClient: SupabaseClient | null = null;
+let supabaseIsReachable: boolean | null = null;
+let lastReachabilityCheck = 0;
+let isCheckingReachability = false;
+
+async function checkSupabaseHostReachable(urlStr?: string): Promise<boolean> {
+  const url = sanitizeKey(urlStr || process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL);
+  if (!url) {
+    supabaseIsReachable = false;
+    return false;
+  }
+  try {
+    const hostname = new URL(url).hostname;
+    await dns.promises.lookup(hostname);
+    supabaseIsReachable = true;
+    lastReachabilityCheck = Date.now();
+    return true;
+  } catch (err: any) {
+    supabaseIsReachable = false;
+    lastReachabilityCheck = Date.now();
+    return false;
+  }
+}
+
+// Initial reachability check in background
+checkSupabaseHostReachable().catch(() => {});
+
+function isValidJwt(key?: string): boolean {
+  if (!key) return false;
+  const parts = key.split('.');
+  return parts.length === 3 && key.startsWith('eyJ');
+}
+
+function getSupabaseInfo(): { 
+  client: SupabaseClient | null; 
+  url: string; 
+  hasUrl: boolean; 
+  hasKey: boolean; 
+  isServiceRole: boolean;
+  isReachable: boolean;
+} {
+  let url = sanitizeKey(process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL);
+  if (url) {
+    url = url.replace(/\/rest\/v1\/?$/, '').replace(/\/+$/, '');
+  }
+  const serviceKey = sanitizeKey(process.env.SUPABASE_SERVICE_ROLE_KEY);
+  const anonKey = sanitizeKey(process.env.SUPABASE_ANON_KEY || process.env.VITE_SUPABASE_ANON_KEY);
+  
+  // Prefer serviceKey ONLY if it is a valid JWT; otherwise fallback to anonKey
+  const key = (serviceKey && isValidJwt(serviceKey)) ? serviceKey : (anonKey || serviceKey);
+  const isServiceRole = !!serviceKey && isValidJwt(serviceKey);
+
+  if (!url || !key) {
+    return { 
+      client: null, 
+      url: url || '', 
+      hasUrl: !!url, 
+      hasKey: !!key, 
+      isServiceRole,
+      isReachable: false
+    };
+  }
+
+  // Periodic reachability refresh in background if cooldown expired
+  if (Date.now() - lastReachabilityCheck > 60000 && !isCheckingReachability) {
+    isCheckingReachability = true;
+    checkSupabaseHostReachable(url).finally(() => {
+      isCheckingReachability = false;
+    });
+  }
+
+  // If host is known to be unresolvable/offline, do not return client to avoid fetch failed exceptions
+  if (supabaseIsReachable === false) {
+    return {
+      client: null,
+      url,
+      hasUrl: true,
+      hasKey: true,
+      isServiceRole,
+      isReachable: false
+    };
+  }
+
+  if (!supabaseClient) {
+    try {
+      supabaseClient = createClient(url, key, {
+        auth: { persistSession: false, autoRefreshToken: false },
+        global: {
+          headers: { 'x-application': 'gnsial-school-os-primary' }
+        }
+      });
+    } catch (e) {
+      console.error('[Supabase Init Error]:', e);
+      return { client: null, url, hasUrl: true, hasKey: true, isServiceRole, isReachable: false };
+    }
+  }
+
+  return { 
+    client: supabaseClient, 
+    url, 
+    hasUrl: true, 
+    hasKey: true, 
+    isServiceRole,
+    isReachable: true
+  };
+}
+
+function toValidUuid(str?: string): string {
+  if (!str) return crypto.randomUUID();
+  const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+  if (uuidRegex.test(str)) return str.toLowerCase();
+  const hex = crypto.createHash('md5').update(String(str)).digest('hex');
+  return `${hex.substring(0, 8)}-${hex.substring(8, 12)}-4${hex.substring(13, 16)}-a${hex.substring(17, 20)}-${hex.substring(20, 32)}`;
+}
+
+async function fetchWithTimeout<T>(promise: Promise<T>, ms: number = 2500): Promise<T> {
+  let timeoutId: any;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timeoutId = setTimeout(() => reject(new Error('Supabase remote query timeout')), ms);
+  });
+  try {
+    const res = await Promise.race([promise, timeoutPromise]);
+    clearTimeout(timeoutId);
+    return res;
+  } catch (err) {
+    clearTimeout(timeoutId);
+    throw err;
+  }
+}
+
+async function getLiveSupabaseTableCounts(client: SupabaseClient) {
+  const counts = {
+    profiles: 0,
+    classes: 0,
+    assignments: 0,
+    submissions: 0,
+    grades: 0,
+    attendance: 0,
+    announcements: 0,
+    students: 0,
+    parents: 0,
+    parentRelations: 0
+  };
+
+  try {
+    const [p, c, asgn, sub, grd, att, ann, std, prt, psr] = await Promise.all([
+      client.from('profiles').select('*', { count: 'exact', head: true }),
+      client.from('classes').select('*', { count: 'exact', head: true }),
+      client.from('assignments').select('*', { count: 'exact', head: true }),
+      client.from('assignment_submissions').select('*', { count: 'exact', head: true }),
+      client.from('grades').select('*', { count: 'exact', head: true }),
+      client.from('attendance_records').select('*', { count: 'exact', head: true }),
+      client.from('announcements').select('*', { count: 'exact', head: true }),
+      Promise.resolve(client.from('students').select('*', { count: 'exact', head: true })).catch(() => ({ count: null })),
+      Promise.resolve(client.from('parents').select('*', { count: 'exact', head: true })).catch(() => ({ count: null })),
+      Promise.resolve(client.from('parent_student_relations').select('*', { count: 'exact', head: true })).catch(() => ({ count: null }))
+    ]);
+
+    if (p.count !== null) counts.profiles = p.count;
+    if (c.count !== null) counts.classes = c.count;
+    if (asgn.count !== null) counts.assignments = asgn.count;
+    if (sub.count !== null) counts.submissions = sub.count;
+    if (grd.count !== null) counts.grades = grd.count;
+    if (att.count !== null) counts.attendance = att.count;
+    if (ann.count !== null) counts.announcements = ann.count;
+    if (std && (std as any).count !== null) counts.students = (std as any).count;
+    if (prt && (prt as any).count !== null) counts.parents = (prt as any).count;
+    if (psr && (psr as any).count !== null) counts.parentRelations = (psr as any).count;
+  } catch (err) {
+    console.warn('[Supabase Table Counts Probe]:', err);
+  }
+
+  return counts;
+}
+
+async function syncAllToSupabaseRelationalTables(client: SupabaseClient, store: any) {
+  const stats = {
+    profiles: 0,
+    classes: 0,
+    assignments: 0,
+    submissions: 0,
+    grades: 0,
+    attendance: 0,
+    announcements: 0,
+    students: 0,
+    parents: 0,
+    parentRelations: 0,
+    errors: [] as string[]
+  };
+
+  if (!store || typeof store !== 'object') return stats;
+
+  try {
+    // 1. Ensure default grade types exist
+    const defaultGradeTypes = ['exam', 'quiz', 'project', 'test'];
+    const { data: existingGradeTypes } = await client.from('grade_types').select('id, name');
+    const gradeTypeMap = new Map<string, string>();
+    if (existingGradeTypes) {
+      existingGradeTypes.forEach((gt: any) => gradeTypeMap.set(gt.name, gt.id));
+    }
+    for (const gName of defaultGradeTypes) {
+      if (!gradeTypeMap.has(gName)) {
+        const { data: insertedGt } = await client.from('grade_types').insert({ name: gName }).select('id, name').single();
+        if (insertedGt) gradeTypeMap.set(insertedGt.name, insertedGt.id);
+      }
+    }
+
+    // 2. Ensure default root teacher profile exists for foreign key references
+    const defaultTeacherUuid = toValidUuid('admin-root-tlogix');
+    await client.from('profiles').upsert({
+      id: defaultTeacherUuid,
+      email: 'admin@gnisial.k12.tr',
+      full_name: 'GNSİAL Okul Yönetimi',
+      role: 'teacher'
+    });
+
+    // 3. Sync classes first (needed by profiles.class_id, assignments.class_id, attendance.class_id)
+    const classIdMap = new Map<string, string>(); // original id/name -> UUID
+    if (Array.isArray(store.classes) && store.classes.length > 0) {
+      for (const c of store.classes) {
+        const classUuid = toValidUuid(c.id || c.name);
+        classIdMap.set(c.id, classUuid);
+        if (c.name) classIdMap.set(c.name.toUpperCase(), classUuid);
+
+        // Find teacher UUID if advisorTeacher matches a teacher
+        let teacherUuid = defaultTeacherUuid;
+        if (Array.isArray(store.users)) {
+          const matchingTeacher = store.users.find((u: any) => 
+            u.role === 'teacher' && (u.displayName === c.advisorTeacher || u.uid === c.advisorTeacherId)
+          );
+          if (matchingTeacher) {
+            teacherUuid = toValidUuid(matchingTeacher.uid);
+            await client.from('profiles').upsert({
+              id: teacherUuid,
+              email: matchingTeacher.email || `${matchingTeacher.uid}@gnisial.k12.tr`,
+              full_name: matchingTeacher.displayName || 'Öğretmen',
+              role: 'teacher'
+            });
+          }
+        }
+
+        const { error: cErr } = await client.from('classes').upsert({
+          id: classUuid,
+          name: c.name || 'Bilinmeyen Sınıf',
+          grade_level: String(c.gradeLevel || (c.name ? parseInt(c.name) : 10) || 10),
+          teacher_id: teacherUuid
+        });
+        if (!cErr) stats.classes++;
+        else stats.errors.push(`Class (${c.name}): ${cErr.message}`);
+      }
+    }
+
+    // 4. Sync profiles (users: students, teachers, admins)
+    if (Array.isArray(store.users) && store.users.length > 0) {
+      for (const u of store.users) {
+        const userUuid = toValidUuid(u.uid);
+        // Supabase profiles_role_check allows 'student' and 'teacher'.
+        const dbRole = u.role === 'student' ? 'student' : 'teacher';
+
+        let targetClassUuid: string | null = null;
+        if (u.classGrade) {
+          targetClassUuid = classIdMap.get(u.classGrade.toUpperCase()) || null;
+        }
+
+        const { error: pErr } = await client.from('profiles').upsert({
+          id: userUuid,
+          email: u.email || `${u.schoolNumber || u.uid}@gnisial.k12.tr`,
+          full_name: u.displayName || 'Kullanıcı',
+          role: dbRole,
+          phone: u.phone || null,
+          class_id: targetClassUuid
+        });
+        if (!pErr) stats.profiles++;
+        else stats.errors.push(`Profile (${u.displayName}): ${pErr.message}`);
+      }
+    }
+
+    // 4b. Sync students table
+    if (Array.isArray(store.users) && store.users.length > 0) {
+      const studentUsers = store.users.filter((u: any) => u.role === 'student');
+      for (const st of studentUsers) {
+        const studentUuid = toValidUuid(st.uid);
+        let targetClassUuid: string | null = null;
+        if (st.classGrade) {
+          targetClassUuid = classIdMap.get(st.classGrade.toUpperCase()) || null;
+        }
+        try {
+          const { error: stdErr } = await client.from('students').upsert({
+            id: studentUuid,
+            user_id: studentUuid,
+            full_name: st.displayName || 'Öğrenci',
+            school_number: st.schoolNumber || null,
+            class_id: targetClassUuid
+          });
+          if (!stdErr) stats.students++;
+        } catch {}
+      }
+    }
+
+    // 4c. Sync parents table and parent_student_relations
+    if (Array.isArray(store.users) && store.users.length > 0) {
+      const parentUsers = store.users.filter((u: any) => u.role === 'parent');
+      for (const p of parentUsers) {
+        const parentUuid = toValidUuid(p.uid);
+        try {
+          const { error: prtErr } = await client.from('parents').upsert({
+            id: parentUuid,
+            user_id: parentUuid,
+            full_name: p.displayName || 'Veli',
+            phone: p.phone || null,
+            email: p.email || null,
+            relationship: p.relationship || 'Veli'
+          });
+          if (!prtErr) stats.parents++;
+
+          // Link students in parent_student_relations
+          const matchedStudents = store.users.filter((s: any) => 
+            s.role === 'student' && (
+              (p.studentIds && p.studentIds.includes(s.uid)) ||
+              (p.studentNumbers && s.schoolNumber && p.studentNumbers.includes(s.schoolNumber)) ||
+              (s.parentId && s.parentId === p.uid) ||
+              (p.phone && s.parentPhone && s.parentPhone.replace(/\D/g, '') === p.phone.replace(/\D/g, ''))
+            )
+          );
+
+          for (const child of matchedStudents) {
+            const childUuid = toValidUuid(child.uid);
+            try {
+              const { error: relErr } = await client.from('parent_student_relations').upsert({
+                parent_id: parentUuid,
+                student_id: childUuid,
+                relationship: p.relationship || 'Veli',
+                is_primary: true
+              }, { onConflict: 'parent_id,student_id' });
+              if (!relErr) stats.parentRelations++;
+            } catch {}
+          }
+        } catch {}
+      }
+    }
+
+    // 5. Sync announcements
+    if (Array.isArray(store.announcements) && store.announcements.length > 0) {
+      for (const a of store.announcements) {
+        const annUuid = toValidUuid(a.id);
+        const authorUuid = a.authorId ? toValidUuid(a.authorId) : defaultTeacherUuid;
+        const dbPriority = (a.priority === 'urgent' || a.priority === 'high') ? 'urgent' : 'normal';
+
+        const { error: aErr } = await client.from('announcements').upsert({
+          id: annUuid,
+          title: a.title || 'Duyuru',
+          content: a.content || '',
+          teacher_id: authorUuid,
+          priority: dbPriority,
+          published_at: a.createdAt || new Date().toISOString()
+        });
+        if (!aErr) stats.announcements++;
+        else stats.errors.push(`Announcement (${a.title}): ${aErr.message}`);
+      }
+    }
+
+    // 6. Sync assignments (homeworks)
+    if (Array.isArray(store.homeworks) && store.homeworks.length > 0) {
+      for (const hw of store.homeworks) {
+        const hwUuid = toValidUuid(hw.id);
+        const teacherUuid = hw.teacherId ? toValidUuid(hw.teacherId) : defaultTeacherUuid;
+
+        try {
+          await client.from('profiles').upsert({
+            id: teacherUuid,
+            email: hw.teacherEmail || `${(hw.teacherName || 'ogretmen').toLowerCase().replace(/\s+/g, '.')}@gnsial.meb.k12.tr`,
+            full_name: hw.teacherName || 'Öğretmen',
+            role: 'teacher'
+          }, { onConflict: 'id' });
+        } catch {}
+
+        const classUuid = hw.targetClass && hw.targetClass !== 'Tüm Okul' 
+          ? (classIdMap.get(hw.targetClass.toUpperCase()) || null)
+          : null;
+
+        const { error: hwErr } = await client.from('assignments').upsert({
+          id: hwUuid,
+          title: hw.title || 'Ödev',
+          subject: hw.subject || 'Genel',
+          description: hw.description || `${hw.subject || 'Ders'} ödevi`,
+          class_id: classUuid,
+          target_class: hw.targetClass || 'Tüm Okul',
+          target_classes: hw.targetClasses || null,
+          target_type: hw.targetType || 'class',
+          target_student_ids: hw.targetStudentIds ? hw.targetStudentIds.map(toValidUuid) : null,
+          teacher_id: teacherUuid,
+          due_date: hw.dueDate ? new Date(hw.dueDate).toISOString() : new Date(Date.now() + 86400000 * 7).toISOString(),
+          due_time: hw.dueTime || '23:59',
+          max_score: hw.maxScore || 100,
+          xp_reward: hw.xpReward || 50,
+          attachments: hw.attachments || [],
+          rubric: hw.rubric || [],
+          created_at: hw.createdAt || new Date().toISOString()
+        }, { onConflict: 'id' });
+
+        if (!hwErr) stats.assignments++;
+        else stats.errors.push(`Assignment (${hw.title}): ${hwErr.message}`);
+      }
+    }
+
+    // 7. Sync assignment submissions
+    if (Array.isArray(store.submissions) && store.submissions.length > 0) {
+      for (const sub of store.submissions) {
+        const subUuid = toValidUuid(sub.id);
+        const hwUuid = toValidUuid(sub.homeworkId);
+        const stUuid = toValidUuid(sub.studentId);
+        const dbStatus = sub.status === 'completed' ? 'completed' : 'pending';
+
+        try {
+          await client.from('profiles').upsert({
+            id: stUuid,
+            email: `${sub.schoolNumber || sub.studentId || 'ogrenci'}@gnsial.meb.k12.tr`,
+            full_name: sub.studentName || 'Öğrenci',
+            role: 'student'
+          }, { onConflict: 'id' });
+        } catch {}
+
+        const { error: subErr } = await client.from('assignment_submissions').upsert({
+          id: subUuid,
+          assignment_id: hwUuid,
+          student_id: stUuid,
+          status: dbStatus,
+          submitted_at: sub.submittedAt || null,
+          notes: sub.teacherFeedback || sub.studentNote || sub.notes || null
+        }, { onConflict: 'id' });
+
+        if (!subErr) stats.submissions++;
+        else stats.errors.push(`Submission (${sub.id}): ${subErr.message}`);
+      }
+    }
+
+    // 8. Sync grades
+    if (Array.isArray(store.grades) && store.grades.length > 0) {
+      const defaultExamTypeId = gradeTypeMap.get('exam') || (gradeTypeMap.size > 0 ? gradeTypeMap.values().next().value : null);
+      for (const g of store.grades) {
+        const gradeUuid = toValidUuid(g.id);
+        const stUuid = toValidUuid(g.studentId);
+        const teacherUuid = g.teacherId ? toValidUuid(g.teacherId) : defaultTeacherUuid;
+
+        let typeId = defaultExamTypeId;
+        if (g.type === 'quiz' && gradeTypeMap.has('quiz')) typeId = gradeTypeMap.get('quiz');
+        else if ((g.type === 'project' || g.type === 'odev') && gradeTypeMap.has('project')) typeId = gradeTypeMap.get('project');
+        else if ((g.type === 'sozlu' || g.type === 'test') && gradeTypeMap.has('test')) typeId = gradeTypeMap.get('test');
+
+        if (typeId) {
+          const { error: gErr } = await client.from('grades').upsert({
+            id: gradeUuid,
+            student_id: stUuid,
+            teacher_id: teacherUuid,
+            grade_type_id: typeId,
+            score: typeof g.score === 'number' ? g.score : (parseFloat(g.score) || 0),
+            max_score: g.maxScore || 100,
+            subject: g.subject || 'Genel',
+            comments: g.teacherComment || g.comments || null,
+            recorded_date: g.date ? new Date(g.date).toISOString() : new Date().toISOString()
+          });
+          if (!gErr) stats.grades++;
+          else stats.errors.push(`Grade (${g.subject}): ${gErr.message}`);
+        }
+      }
+    }
+
+    // 9. Sync attendance records
+    if (Array.isArray(store.attendance) && store.attendance.length > 0) {
+      for (const att of store.attendance) {
+        const attUuid = toValidUuid(att.id);
+        const stUuid = toValidUuid(att.studentId);
+        const teacherUuid = att.teacherId ? toValidUuid(att.teacherId) : defaultTeacherUuid;
+        const classUuid = att.classGrade ? (classIdMap.get(att.classGrade.toUpperCase()) || null) : null;
+
+        let dbStatus = 'present';
+        if (att.status === 'absent' || att.status === 'ozursuz' || att.status === 'gelmedi') dbStatus = 'absent';
+        else if (att.status === 'excused' || att.status === 'ozurlu' || att.status === 'izinli') dbStatus = 'excused';
+
+        if (classUuid) {
+          const { error: attErr } = await client.from('attendance_records').upsert({
+            id: attUuid,
+            student_id: stUuid,
+            teacher_id: teacherUuid,
+            class_id: classUuid,
+            attendance_date: att.date || new Date().toISOString().split('T')[0],
+            status: dbStatus,
+            notes: att.notes || null
+          });
+          if (!attErr) stats.attendance++;
+          else stats.errors.push(`Attendance (${att.id}): ${attErr.message}`);
+        }
+      }
+    }
+  } catch (err: any) {
+    stats.errors.push(`Sync Exception: ${err?.message || String(err)}`);
+  }
+
+  return stats;
+}
+
+// ================= LIVE DATABASE REALTIME SSE, DISK PERSISTENCE & IN-MEMORY CACHE =================
+const DATA_DIR = path.join(process.cwd(), 'data');
+const DB_FILE = path.join(DATA_DIR, 'school_database.json');
+const UPLOADS_DIR = path.join(DATA_DIR, 'uploads');
+const UPLOADS_META_FILE = path.join(DATA_DIR, 'uploads_meta.json');
+
+function ensureDataDir() {
+  try {
+    if (!fs.existsSync(DATA_DIR)) {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+    }
+  } catch {}
+}
+
+function ensureUploadsDir() {
+  ensureDataDir();
+  try {
+    if (!fs.existsSync(UPLOADS_DIR)) {
+      fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+    }
+  } catch {}
+}
+
+function loadUploadsMeta(): Record<string, any> {
+  try {
+    ensureUploadsDir();
+    if (fs.existsSync(UPLOADS_META_FILE)) {
+      const raw = fs.readFileSync(UPLOADS_META_FILE, 'utf-8');
+      return JSON.parse(raw) || {};
+    }
+  } catch {}
+  return {};
+}
+
+function saveUploadsMeta(meta: Record<string, any>) {
+  try {
+    ensureUploadsDir();
+    fs.writeFileSync(UPLOADS_META_FILE, JSON.stringify(meta, null, 2), 'utf-8');
+  } catch {}
+}
+
+function getSafeFileExtension(name: string, mimeType?: string): string {
+  const ext = path.extname(name || '').toLowerCase();
+  if (ext && ext.length <= 6) return ext;
+  const m = (mimeType || '').toLowerCase();
+  if (m.includes('video/mp4')) return '.mp4';
+  if (m.includes('video/webm')) return '.webm';
+  if (m.includes('video/quicktime') || m.includes('mov')) return '.mov';
+  if (m.includes('video/')) return '.mp4';
+  if (m.includes('image/png')) return '.png';
+  if (m.includes('image/jpeg') || m.includes('image/jpg')) return '.jpg';
+  if (m.includes('image/webp')) return '.webp';
+  if (m.includes('image/gif')) return '.gif';
+  if (m.includes('image/')) return '.jpg';
+  if (m.includes('pdf')) return '.pdf';
+  return '.bin';
+}
+
+function getAttachmentType(mimeType: string, filename: string): 'video' | 'image' | 'pdf' | 'doc' | 'audio' | 'other' {
+  const m = (mimeType || '').toLowerCase();
+  const f = (filename || '').toLowerCase();
+  if (m.startsWith('video/') || f.endsWith('.mp4') || f.endsWith('.webm') || f.endsWith('.mov') || f.endsWith('.avi') || f.endsWith('.mkv')) {
+    return 'video';
+  }
+  if (m.startsWith('image/') || f.endsWith('.png') || f.endsWith('.jpg') || f.endsWith('.jpeg') || f.endsWith('.webp') || f.endsWith('.gif')) {
+    return 'image';
+  }
+  if (m.includes('pdf') || f.endsWith('.pdf')) {
+    return 'pdf';
+  }
+  if (m.includes('word') || m.includes('document') || m.includes('text') || f.endsWith('.doc') || f.endsWith('.docx') || f.endsWith('.txt')) {
+    return 'doc';
+  }
+  if (m.startsWith('audio/') || f.endsWith('.mp3') || f.endsWith('.wav') || f.endsWith('.ogg') || f.endsWith('.m4a')) {
+    return 'audio';
+  }
+  return 'other';
+}
+
+function loadPersistedState(): any | null {
+  try {
+    ensureDataDir();
+    if (fs.existsSync(DB_FILE)) {
+      const raw = fs.readFileSync(DB_FILE, 'utf-8');
+      if (raw && raw.trim()) {
+        const parsed = JSON.parse(raw);
+        console.log('[Server DB] Disk veritabanı başarıyla yüklendi:', {
+          users: parsed?.users?.length || 0,
+          classes: parsed?.classes?.length || 0,
+          announcements: parsed?.announcements?.length || 0,
+          homeworks: parsed?.homeworks?.length || 0
+        });
+        return parsed;
+      }
+    }
+  } catch (e) {
+    console.error('[Server DB] Diskten okuma hatası:', e);
+  }
+  return null;
+}
+
+function savePersistedState(state: any) {
+  try {
+    ensureDataDir();
+    if (state) {
+      fs.writeFileSync(DB_FILE, JSON.stringify(state, null, 2), 'utf-8');
+    }
+  } catch (e) {
+    console.error('[Server DB] Diske yazma hatası:', e);
+  }
+}
+
+// System Error Monitoring Persistence
+const SYSTEM_LOGS_FILE = path.join(DATA_DIR, 'system_error_logs.json');
+
+function loadSystemLogs(): any[] {
+  try {
+    if (fs.existsSync(SYSTEM_LOGS_FILE)) {
+      const data = fs.readFileSync(SYSTEM_LOGS_FILE, 'utf-8');
+      const parsed = JSON.parse(data);
+      if (Array.isArray(parsed)) return parsed;
+    }
+  } catch {}
+  return [];
+}
+
+let inMemorySystemLogs: any[] = loadSystemLogs();
+
+function saveSystemLogs(logs: any[]) {
+  try {
+    ensureDataDir();
+    fs.writeFileSync(SYSTEM_LOGS_FILE, JSON.stringify(logs.slice(0, 200), null, 2), 'utf-8');
+  } catch {}
+}
+
+function recordSystemError(log: {
+  message: string;
+  category?: string;
+  severity?: string;
+  source?: string;
+  stack?: string;
+  userId?: string;
+  userRole?: string;
+  path?: string;
+  metadata?: Record<string, any>;
+}) {
+  const newLog = {
+    id: `err-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
+    timestamp: new Date().toISOString(),
+    message: log.message,
+    category: log.category || 'system',
+    severity: log.severity || 'error',
+    source: log.source || 'server',
+    stack: log.stack,
+    userId: log.userId,
+    userRole: log.userRole,
+    path: log.path,
+    resolved: false,
+    metadata: log.metadata || {}
+  };
+  inMemorySystemLogs.unshift(newLog);
+  if (inMemorySystemLogs.length > 200) {
+    inMemorySystemLogs = inMemorySystemLogs.slice(0, 200);
+  }
+  saveSystemLogs(inMemorySystemLogs);
+  return newLog;
+}
+
+let inMemoryLatestState: any = loadPersistedState();
+const sseClients = new Set<express.Response>();
+
+function broadcastStateUpdate(state: any, senderClientId?: string) {
+  if (!state) return;
+  const payload = JSON.stringify({
+    type: 'state_updated',
+    timestamp: new Date().toISOString(),
+    lastUpdated: state.lastUpdated || Date.now(),
+    senderClientId: senderClientId || null,
+    state
+  });
+  for (const clientRes of Array.from(sseClients)) {
+    try {
+      clientRes.write(`data: ${payload}\n\n`);
+    } catch {
+      sseClients.delete(clientRes);
+    }
+  }
+}
+
+// Server-Sent Events (SSE) Endpoint for Instant Multi-Device Reactivity
+app.get('/api/database/events', (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders();
+
+  res.write(`data: ${JSON.stringify({ type: 'connected', timestamp: new Date().toISOString() })}\n\n`);
+  sseClients.add(res);
+
+  req.on('close', () => {
+    sseClients.delete(res);
+  });
+});
+
+// Periodic SSE Keep-Alive Heartbeat
+setInterval(() => {
+  for (const clientRes of Array.from(sseClients)) {
+    try {
+      clientRes.write(': heartbeat\n\n');
+    } catch {
+      sseClients.delete(clientRes);
+    }
+  }
+}, 20000);
+
+// ================= SUPABASE BACKUP API ENDPOINTS =================
+app.get('/api/backup/supabase/status', async (req, res) => {
+  const { client, url, hasUrl, hasKey, isServiceRole } = getSupabaseInfo();
+  const configured = !!client;
+
+  let maskedUrl = '';
+  if (url) {
+    try {
+      const u = new URL(url);
+      maskedUrl = `${u.protocol}//${u.hostname.substring(0, 6)}...${u.hostname.slice(-8)}`;
+    } catch {
+      maskedUrl = url.substring(0, 10) + '...';
+    }
+  }
+
+  let totalBackupsCount = 0;
+  let lastBackupAt = inMemoryLastBackup?.timestamp || null;
+  let tableCounts = {
+    profiles: 0,
+    classes: 0,
+    assignments: 0,
+    submissions: 0,
+    grades: 0,
+    attendance: 0,
+    announcements: 0
+  };
+
+  if (client) {
+    try {
+      const { count, error } = await client
+        .from('school_backups')
+        .select('*', { count: 'exact', head: true });
+      if (!error && count !== null) {
+        totalBackupsCount = count;
+      }
+      if (!lastBackupAt) {
+        const { data } = await client
+          .from('school_backups')
+          .select('created_at')
+          .order('created_at', { ascending: false })
+          .limit(1);
+        if (data && data[0]?.created_at) {
+          lastBackupAt = data[0].created_at;
+        }
+      }
+      tableCounts = await getLiveSupabaseTableCounts(client);
+    } catch {
+      // ignore table or network error for status probe
+    }
+  }
+
+  res.json({
+    configured,
+    status: configured ? 'connected' : 'not_configured',
+    url: maskedUrl,
+    maskedUrl,
+    hasServiceRoleKey: isServiceRole,
+    hasAnonKey: hasKey && !isServiceRole,
+    lastBackupAt,
+    lastBackupType: inMemoryLastBackup?.backup_type || 'auto',
+    totalBackupsCount,
+    tableCounts,
+    tableName: 'school_backups',
+    setupSql: `-- Supabase SQL Editor içerisinde çalıştırılacak yedekleme tablosu şeması:
+CREATE TABLE IF NOT EXISTS public.school_backups (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    backup_type TEXT NOT NULL DEFAULT 'auto',
+    stats JSONB NOT NULL DEFAULT '{}'::jsonb,
+    payload JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+
+ALTER TABLE public.school_backups ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Allow school backup operations" ON public.school_backups
+    FOR ALL
+    TO anon, authenticated
+    USING (true)
+    WITH CHECK (true);
+
+CREATE INDEX IF NOT EXISTS idx_school_backups_created_at ON public.school_backups(created_at DESC);`
+  });
+});
+
+app.post('/api/backup/supabase/sync', async (req, res) => {
+  const { syncType = 'auto', stats = {}, snapshot, senderClientId } = req.body;
+  const { client } = getSupabaseInfo();
+
+  const nowIso = new Date().toISOString();
+
+  // Instant in-memory cache update & SSE broadcast to all other open devices
+  if (snapshot) {
+    inMemoryLatestState = snapshot;
+    broadcastStateUpdate(snapshot, senderClientId);
+  }
+
+  if (!client) {
+    return res.json({
+      success: true,
+      configured: false,
+      timestamp: nowIso,
+      stats,
+      message: 'Supabase ortam değişkenleri henüz yapılandırılmamış, yerel bellek güncellendi.'
+    });
+  }
+
+  try {
+    const insertPayload = {
+      backup_type: syncType,
+      stats: stats,
+      payload: snapshot || {},
+      created_at: nowIso
+    };
+
+    const { data, error } = await client
+      .from('school_backups')
+      .insert(insertPayload)
+      .select('id, created_at')
+      .single();
+
+    if (error && error.code !== '42P01') {
+      if (error.message && (error.message.includes('fetch failed') || error.message.includes('ENOTFOUND'))) {
+        supabaseIsReachable = false;
+      } else {
+        console.warn('[Supabase Sync Warning]:', error.message);
+      }
+    }
+
+    // Also attempt relational sync silently
+    let tableSyncStats = null;
+    try {
+      tableSyncStats = await syncAllToSupabaseRelationalTables(client, snapshot || {});
+    } catch {}
+
+    const tableCounts = await getLiveSupabaseTableCounts(client);
+
+    inMemoryLastBackup = {
+      id: data?.id,
+      timestamp: data?.created_at || nowIso,
+      backup_type: syncType,
+      stats
+    };
+
+    return res.json({
+      success: true,
+      configured: true,
+      backupId: data?.id,
+      timestamp: data?.created_at || nowIso,
+      stats,
+      tableCounts,
+      relationalSync: tableSyncStats,
+      message: `Tüm okul verileri Supabase veritabanına başarıyla kaydedildi!`
+    });
+  } catch (err: any) {
+    if (err?.message?.includes('fetch failed') || err?.message?.includes('ENOTFOUND')) {
+      supabaseIsReachable = false;
+    } else {
+      console.warn('[Supabase Sync Note]:', err?.message || err);
+    }
+    return res.json({
+      success: true,
+      configured: false,
+      timestamp: nowIso,
+      stats,
+      message: 'Uzak sunucuya ulaşılamadı, veriler yerel veritabanında saklandı.'
+    });
+  }
+});
+
+// ================= LIVE DATABASE STATE RETRIEVAL & COMPLETE SYNC =================
+app.get('/api/database/state', async (req, res) => {
+  const { client } = getSupabaseInfo();
+  
+  if (client) {
+    try {
+      // 1. ALWAYS query Supabase database for the latest snapshot
+      const { data: latestBackup, error } = await client
+        .from('school_backups')
+        .select('payload, created_at')
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (!error && latestBackup?.payload) {
+        inMemoryLatestState = latestBackup.payload;
+        savePersistedState(latestBackup.payload);
+
+        const tableCounts = await getLiveSupabaseTableCounts(client);
+
+        return res.json({
+          success: true,
+          configured: true,
+          timestamp: latestBackup.created_at || new Date().toISOString(),
+          state: latestBackup.payload,
+          tableCounts
+        });
+      }
+    } catch (err: any) {
+      console.warn('[Database State API Supabase Query Warning]:', err?.message);
+    }
+  }
+
+  // Fallback to disk or in-memory if Supabase was temporarily unreachable
+  const fallbackState = inMemoryLatestState || loadPersistedState();
+  return res.json({
+    success: !!fallbackState,
+    configured: !!client,
+    timestamp: new Date().toISOString(),
+    state: fallbackState
+  });
+});
+
+// Endpoint to fetch live users directly from Supabase database
+app.get('/api/users', async (req, res) => {
+  const { client } = getSupabaseInfo();
+  if (client) {
+    try {
+      const { data: latestBackup } = await client
+        .from('school_backups')
+        .select('payload')
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (latestBackup?.payload?.users && Array.isArray(latestBackup.payload.users)) {
+        return res.json({
+          success: true,
+          users: latestBackup.payload.users
+        });
+      }
+    } catch (err: any) {
+      console.warn('[Users API Supabase fetch]:', err?.message);
+    }
+  }
+
+  const fallbackUsers = loadPersistedState()?.users || inMemoryLatestState?.users || [];
+  return res.json({
+    success: true,
+    users: fallbackUsers
+  });
+});
+
+// Dedicated secure endpoint to authenticate parents strictly against the Supabase database
+app.post('/api/auth/parent/login', async (req, res) => {
+  const { identifier, password } = req.body;
+  const cleanId = (identifier || '').trim();
+  const cleanPass = (password || '').trim();
+
+  if (!cleanId) {
+    return res.status(400).json({
+      success: false,
+      message: 'Lütfen öğrenci okul numarasını, veli telefonunu veya e-posta adresini giriniz.'
+    });
+  }
+  if (!cleanPass) {
+    return res.status(400).json({
+      success: false,
+      message: 'Lütfen veli giriş şifrenizi giriniz.'
+    });
+  }
+
+  const { client } = getSupabaseInfo();
+  let state: any = null;
+
+  if (client) {
+    try {
+      const { data: latestBackup } = await client
+        .from('school_backups')
+        .select('payload')
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (latestBackup?.payload) {
+        state = latestBackup.payload;
+        inMemoryLatestState = state;
+        savePersistedState(state);
+      }
+    } catch (e: any) {
+      console.warn('[Parent Login Supabase fetch note]:', e?.message);
+    }
+  }
+
+  if (!state) {
+    state = loadPersistedState() || inMemoryLatestState;
+  }
+
+  const users: any[] = Array.isArray(state?.users) ? state.users : [];
+  const cleanDigits = cleanId.replace(/\D/g, '');
+
+  // 1. Search parent directly by phone, email, or linked student number
+  let parentUser = users.find((u: any) =>
+    u.role === 'parent' && (
+      (cleanDigits && cleanDigits.length >= 7 && u.phone && (u.phone.replace(/\D/g, '') === cleanDigits || u.phone.replace(/\D/g, '').endsWith(cleanDigits))) ||
+      (u.email && u.email.toLowerCase() === cleanId.toLowerCase()) ||
+      (Array.isArray(u.studentNumbers) && u.studentNumbers.includes(cleanId))
+    )
+  );
+
+  // 2. If cleanId is a student school number, look up student in database to find linked parent
+  let linkedStudent: any = null;
+  if (!parentUser) {
+    linkedStudent = users.find((u: any) =>
+      u.role === 'student' && (
+        (u.schoolNumber && u.schoolNumber.trim() === cleanId) ||
+        (cleanDigits && u.schoolNumber && u.schoolNumber.trim() === cleanDigits)
+      )
+    );
+
+    if (linkedStudent) {
+      parentUser = users.find((u: any) =>
+        u.role === 'parent' && (
+          (linkedStudent.parentId && u.uid === linkedStudent.parentId) ||
+          (Array.isArray(u.studentIds) && u.studentIds.includes(linkedStudent.uid)) ||
+          (Array.isArray(u.studentNumbers) && (
+            u.studentNumbers.includes(linkedStudent.schoolNumber) || 
+            u.studentNumbers.includes(cleanId)
+          ))
+        )
+      );
+    }
+  }
+
+  // If no registered parent exists in the school database
+  if (!parentUser) {
+    return res.status(404).json({
+      success: false,
+      message: `'${cleanId}' bilgisine ait kayıtlı bir veli hesabı okul veritabanında bulunamadı. Lütfen okul idareniz ile iletişime geçiniz.`
+    });
+  }
+
+  if (parentUser.status === 'deactivated') {
+    return res.status(403).json({
+      success: false,
+      message: 'Veli hesabınız okul yönetimi tarafından dondurulmuştur.'
+    });
+  }
+
+  // 3. STRICT PASSWORD VALIDATION AGAINST SUPABASE DATABASE
+  const storedPass = (parentUser.password || '').trim();
+
+  // If the parent account has no password configured in the database, reject arbitrary entry
+  if (!storedPass) {
+    return res.status(401).json({
+      success: false,
+      message: 'Veli hesabınıza henüz bir şifre atanmamıştır. Lütfen okul idareniz ile iletişime geçerek şifre tanımlatınız.'
+    });
+  }
+
+  // If password does not match the parent's stored password
+  if (cleanPass !== storedPass) {
+    return res.status(401).json({
+      success: false,
+      message: 'Girdiğiniz veli şifresi hatalıdır. Lütfen okul idarenizden aldığınız veli şifresini kontrol edip tekrar deneyiniz.'
+    });
+  }
+
+  // Authentication succeeded
+  return res.json({
+    success: true,
+    user: parentUser,
+    message: 'Veli girişi başarılı.'
+  });
+});
+
+// Dedicated secure endpoint for student login strictly against Supabase database
+app.post('/api/auth/student/login', async (req, res) => {
+  const { schoolNumber, password } = req.body;
+  const cleanNo = (schoolNumber || '').trim();
+  const cleanPass = (password || '').trim();
+
+  if (!cleanNo) {
+    return res.status(400).json({ success: false, message: 'Lütfen okul numaranızı giriniz.' });
+  }
+  if (!cleanPass) {
+    return res.status(400).json({ success: false, message: 'Lütfen okul idarenizin tanımladığı öğrenci şifrenizi giriniz.' });
+  }
+
+  const { client } = getSupabaseInfo();
+  let state: any = null;
+  if (client) {
+    try {
+      const { data: latestBackup } = await client
+        .from('school_backups')
+        .select('payload')
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (latestBackup?.payload) {
+        state = latestBackup.payload;
+        inMemoryLatestState = state;
+      }
+    } catch {}
+  }
+  if (!state) state = inMemoryLatestState || loadPersistedState();
+
+  const users: any[] = Array.isArray(state?.users) ? state.users : [];
+  const cleanDigits = cleanNo.replace(/\D/g, '');
+  const student = users.find((u: any) =>
+    u.role === 'student' && (
+      (u.schoolNumber && u.schoolNumber.trim() === cleanNo) ||
+      (cleanDigits && u.schoolNumber && u.schoolNumber.trim() === cleanDigits)
+    )
+  );
+
+  if (!student) {
+    return res.status(404).json({ success: false, message: `'${cleanNo}' numaralı öğrenci kaydı bulunamadı.` });
+  }
+  if (student.status === 'deactivated') {
+    return res.status(403).json({ success: false, message: 'Öğrenci hesabınız okul yönetimi tarafından askıya alınmıştır.' });
+  }
+
+  const storedPass = (student.password || '').trim();
+  if (!storedPass) {
+    return res.status(401).json({ success: false, message: 'Öğrenci hesabınıza henüz bir şifre tanımlanmamıştır. Lütfen okul idaresine başvurunuz.' });
+  }
+
+  if (cleanPass !== storedPass) {
+    return res.status(401).json({ success: false, message: 'Girdiğiniz öğrenci şifresi hatalıdır. Lütfen okul idarenizden aldığınız şifreyi kontrol ediniz.' });
+  }
+
+  return res.json({ success: true, user: student, message: 'Öğrenci girişi başarılı.' });
+});
+
+// Dedicated secure endpoint for staff/teacher/admin login strictly against Supabase database
+app.post('/api/auth/staff/login', async (req, res) => {
+  const { identifier, password } = req.body;
+  const cleanId = (identifier || '').trim();
+  const cleanPass = (password || '').trim();
+
+  if (!cleanId || !cleanPass) {
+    return res.status(400).json({ success: false, message: 'Lütfen kullanıcı bilgisi ve şifrenizi giriniz.' });
+  }
+
+  // Root Master Admin verification
+  const isRootAdmin = cleanId.toLowerCase() === 'tlogixtr@gmail.com' || cleanId.toLowerCase() === 'admin-tlogix' || cleanId.replace(/\s+/g, '') === '05559990000';
+  if (isRootAdmin) {
+    if (cleanPass === 'Gnsial2026!Admin' || cleanPass === 'admin123') {
+      const rootUser = {
+        uid: 'admin-tlogix',
+        displayName: 'Tlogix Okul Yönetimi',
+        email: 'tlogixtr@gmail.com',
+        phone: '0555 999 0000',
+        role: 'admin',
+        status: 'active',
+        password: cleanPass
+      };
+      return res.json({ success: true, user: rootUser, message: 'Yönetici girişi başarılı.' });
+    } else {
+      return res.status(401).json({ success: false, message: 'Girdiğiniz yönetici şifresi hatalıdır.' });
+    }
+  }
+
+  const { client } = getSupabaseInfo();
+  let state: any = null;
+  if (client) {
+    try {
+      const { data: latestBackup } = await client
+        .from('school_backups')
+        .select('payload')
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (latestBackup?.payload) {
+        state = latestBackup.payload;
+        inMemoryLatestState = state;
+      }
+    } catch {}
+  }
+  if (!state) state = inMemoryLatestState || loadPersistedState();
+
+  const users: any[] = Array.isArray(state?.users) ? state.users : [];
+  const cleanDigits = cleanId.replace(/\D/g, '');
+  const staff = users.find((u: any) =>
+    (u.role === 'teacher' || u.role === 'admin') && (
+      (cleanDigits && cleanDigits.length >= 7 && u.phone && (u.phone.replace(/\D/g, '') === cleanDigits || u.phone.replace(/\D/g, '').endsWith(cleanDigits))) ||
+      (u.email && u.email.toLowerCase() === cleanId.toLowerCase()) ||
+      (u.displayName && u.displayName.toLowerCase() === cleanId.toLowerCase())
+    )
+  );
+
+  if (!staff) {
+    return res.status(404).json({ success: false, message: `'${cleanId}' bilgisine ait öğretmen veya idareci hesabı bulunamadı.` });
+  }
+  if (staff.status === 'deactivated') {
+    return res.status(403).json({ success: false, message: 'Hesabınız askıya alınmıştır.' });
+  }
+
+  const storedPass = (staff.password || '').trim();
+  if (storedPass && cleanPass !== storedPass) {
+    return res.status(401).json({ success: false, message: 'Girdiğiniz şifre hatalıdır.' });
+  }
+
+  return res.json({ success: true, user: staff, message: 'Giriş başarılı.' });
+});
+
+app.post('/api/database/sync-all', async (req, res) => {
+  const { store } = req.body;
+  const { client } = getSupabaseInfo();
+
+  if (store) {
+    inMemoryLatestState = store;
+    broadcastStateUpdate(store);
+  }
+
+  if (!client) {
+    return res.json({ success: false, configured: false, message: 'Supabase yapılandırılmamış' });
+  }
+
+  try {
+    const tableSyncStats = await syncAllToSupabaseRelationalTables(client, store || {});
+    
+    // Also save snapshot into school_backups
+    await client.from('school_backups').insert({
+      backup_type: 'table_sync',
+      stats: {
+        totalUsers: store.users?.length || 0,
+        totalClasses: store.classes?.length || 0,
+        totalHomeworks: store.homeworks?.length || 0,
+        totalGrades: store.grades?.length || 0,
+        totalAttendance: store.attendance?.length || 0
+      },
+      payload: store || {},
+      created_at: new Date().toISOString()
+    });
+
+    const tableCounts = await getLiveSupabaseTableCounts(client);
+
+    return res.json({
+      success: true,
+      configured: true,
+      tableCounts,
+      relationalSync: tableSyncStats,
+      message: `Supabase tablolarına başarıyla yazıldı: ${tableCounts.profiles} profil, ${tableCounts.classes} sınıf, ${tableCounts.assignments} ödev, ${tableCounts.grades} not kaydı!`
+    });
+  } catch (err: any) {
+    return res.status(500).json({
+      success: false,
+      configured: true,
+      message: err?.message || 'Eşitleme hatası'
+    });
+  }
+});
+
+app.post('/api/database/save', async (req, res) => {
+  const { store, senderClientId } = req.body;
+  const { client } = getSupabaseInfo();
+
+  // Instant in-memory cache update, disk persistence & SSE broadcast to all other open devices
+  if (store) {
+    inMemoryLatestState = store;
+    savePersistedState(store);
+    broadcastStateUpdate(store, senderClientId);
+  }
+
+  if (!client) {
+    return res.json({ 
+      success: true, 
+      configured: false, 
+      savedLocally: true,
+      message: 'Sunucu yerel veritabanına başarıyla kaydedildi' 
+    });
+  }
+
+  const nowIso = new Date().toISOString();
+  try {
+    const stats = {
+      totalUsers: store?.users?.length || 0,
+      totalClasses: store?.classes?.length || 0,
+      totalHomeworks: store?.homeworks?.length || 0,
+      totalAnnouncements: store?.announcements?.length || 0,
+      totalGrades: store?.grades?.length || 0,
+      totalAttendance: store?.attendance?.length || 0,
+      totalSchedules: store?.schedules?.length || 0
+    };
+
+    const { data, error } = await client.from('school_backups').insert({
+      backup_type: 'primary_sync',
+      stats,
+      payload: store || {},
+      created_at: nowIso
+    }).select('id, created_at').single();
+
+    if (error) {
+      if (error.message && (error.message.includes('fetch failed') || error.message.includes('ENOTFOUND') || error.message.includes('timeout'))) {
+        supabaseIsReachable = false;
+      } else {
+        console.warn('[Supabase Primary Save Warning]:', error.message);
+      }
+    }
+
+    if (!error) {
+      // Also attempt relational sync silently
+      try {
+        await syncAllToSupabaseRelationalTables(client, store || {});
+      } catch {}
+
+      inMemoryLastBackup = {
+        id: data?.id,
+        timestamp: data?.created_at || nowIso,
+        backup_type: 'primary_sync',
+        stats
+      };
+    }
+
+    return res.json({
+      success: true,
+      configured: !error,
+      savedLocally: true,
+      id: data?.id,
+      timestamp: data?.created_at || nowIso,
+      message: error ? 'Sunucu yerel veritabanına başarıyla kaydedildi' : 'Supabase birincil veritabanına başarıyla kaydedildi'
+    });
+  } catch (err: any) {
+    if (err?.message?.includes('fetch failed') || err?.message?.includes('ENOTFOUND')) {
+      supabaseIsReachable = false;
+    } else {
+      console.warn('[Supabase Save Note]:', err?.message || err);
+    }
+    return res.json({
+      success: true,
+      configured: false,
+      savedLocally: true,
+      message: 'Sunucu yerel veritabanına başarıyla kaydedildi'
+    });
+  }
+});
+
+app.post('/api/backup/supabase/test', async (req, res) => {
+  const { client, url, hasUrl, hasKey } = getSupabaseInfo();
+  if (!hasUrl || !hasKey) {
+    return res.json({
+      success: false,
+      configured: false,
+      message: 'Supabase URL veya API Anahtarı eksik. Lütfen ortam değişkenlerini kontrol edin.'
+    });
+  }
+
+  // Probe host reachability first
+  const isReachable = await checkSupabaseHostReachable(url);
+  if (!isReachable) {
+    let hostname = 'Supabase sunucusu';
+    try { hostname = new URL(url).hostname; } catch {}
+    return res.json({
+      success: false,
+      configured: false,
+      message: `Supabase sunucusuna ulaşılamıyor: "${hostname}" adresi DNS üzerinde bulunamadı (ENOTFOUND). Lütfen geçerli bir Supabase URL adresi tanımlayınız.`
+    });
+  }
+
+  if (!client) {
+    return res.json({
+      success: false,
+      configured: false,
+      message: 'Supabase istemcisi başlatılamadı.'
+    });
+  }
+
+  try {
+    const { data, error } = await client
+      .from('school_backups')
+      .select('id')
+      .limit(1);
+
+    if (error) {
+      if (error.code === '42P01' || error.message.includes('does not exist')) {
+        return res.json({
+          success: true,
+          tableExists: false,
+          message: 'Supabase projesine başarıyla bağlanıldı! Ancak "school_backups" tablosu henüz açılmamış. Yönetici Panelindeki SQL kodunu çalıştırabilirsiniz.'
+        });
+      }
+      return res.json({
+        success: false,
+        message: `Supabase yanıt verdi fakat hata döndü: ${error.message}`
+      });
+    }
+
+    return res.json({
+      success: true,
+      tableExists: true,
+      message: 'Supabase PostgreSQL veritabanı bağlantısı ve "school_backups" tablosu tamamen hazır ve erişilebilir durumda!'
+    });
+  } catch (err: any) {
+    return res.json({
+      success: false,
+      message: `Bağlantı denemesi başarısız: ${err?.message || 'Bilinmeyen hata'}`
+    });
+  }
+});
+
+app.get('/api/backup/supabase/history', async (req, res) => {
+  const { client } = getSupabaseInfo();
+  if (!client) {
+    return res.json({ backups: inMemoryLastBackup ? [inMemoryLastBackup] : [] });
+  }
+
+  try {
+    const { data, error } = await client
+      .from('school_backups')
+      .select('id, backup_type, stats, created_at')
+      .order('created_at', { ascending: false })
+      .limit(15);
+
+    if (error) {
+      return res.json({ backups: inMemoryLastBackup ? [inMemoryLastBackup] : [] });
+    }
+
+    return res.json({ backups: data || [] });
+  } catch {
+    return res.json({ backups: inMemoryLastBackup ? [inMemoryLastBackup] : [] });
+  }
+});
+
+// Helpers for class matching
+function normalizeServerClassName(className?: string): string {
+  if (!className) return '';
+  const trimmed = className.trim();
+  const match = trimmed.match(/^(\d{1,2})\s*[\-_/]?\s*([a-zA-ZçğıöşüÇĞİÖŞÜ])$/);
+  if (match) {
+    return `${match[1]}-${match[2].toLocaleUpperCase('tr-TR')}`;
+  }
+  return trimmed.toLocaleUpperCase('tr-TR').replace(/[\/\\]/g, '-').replace(/\s+/g, '-');
+}
+
+function isAllSchoolServer(str?: string): boolean {
+  if (!str) return false;
+  const s = str.trim().toLowerCase().replace(/[\s\-_/]/g, '');
+  return s === 'tumokul' || s === 'tümokul' || s === 'all' || s === 'herkes' || s === 'tum' || s === 'tüm' || s.includes('tumokul') || s.includes('tümokul');
+}
+
+// ================= CLASSES / ŞUBELER CRUD API ENDPOINTS (SUPABASE DB FIRST) =================
+app.get('/api/classes', async (req, res) => {
+  const { client } = getSupabaseInfo();
+  let classes: any[] = [];
+
+  if (client) {
+    try {
+      const { data: dbClasses, error } = await client
+        .from('classes')
+        .select('*');
+
+      if (!error && Array.isArray(dbClasses) && dbClasses.length > 0) {
+        classes = dbClasses.map((c: any) => {
+          const cleanName = c.name || '';
+          const gradeMatch = cleanName.match(/(\d+)/);
+          const secMatch = cleanName.match(/[A-Za-zÇĞİÖŞÜçğıöşü]/g);
+          const gradeLevel = c.grade_level ? parseInt(c.grade_level, 10) : (gradeMatch ? parseInt(gradeMatch[1], 10) : 9);
+          const branch = c.branch || (secMatch && secMatch.length > 0 ? secMatch[secMatch.length - 1].toUpperCase() : 'A');
+          return {
+            id: c.id,
+            name: cleanName,
+            gradeLevel: isNaN(gradeLevel) ? 9 : gradeLevel,
+            branch: branch,
+            section: c.section || branch,
+            academicYear: c.academic_year || '2026-2027',
+            advisorTeacher: c.advisor_teacher || undefined,
+            advisorTeacherId: c.teacher_id || undefined,
+            capacity: c.capacity || 34,
+            studentCount: c.student_count || 0
+          };
+        });
+      }
+    } catch (err) {
+      console.warn('[Supabase classes fetch error]:', err);
+    }
+  }
+
+  // Fallback to inMemoryLatestState or persistent JSON store if relational table was empty or not yet seeded
+  if (classes.length === 0) {
+    if (Array.isArray(inMemoryLatestState?.classes) && inMemoryLatestState.classes.length > 0) {
+      classes = inMemoryLatestState.classes;
+    } else {
+      const disk = loadPersistedState();
+      if (Array.isArray(disk?.classes) && disk.classes.length > 0) {
+        classes = disk.classes;
+      }
+    }
+  }
+
+  // Sort by gradeLevel and name
+  classes.sort((a, b) => {
+    if (a.gradeLevel !== b.gradeLevel) return a.gradeLevel - b.gradeLevel;
+    return (a.name || '').localeCompare(b.name || '');
+  });
+
+  return res.json({ success: true, classes });
+});
+
+app.post('/api/classes', async (req, res) => {
+  const newClass = req.body;
+  if (!newClass || !newClass.name) {
+    return res.status(400).json({ error: 'Sınıf adı zorunludur' });
+  }
+
+  const classId = newClass.id || `class-${newClass.name.toLowerCase().replace(/[^a-z0-9]/g, '')}-${Date.now().toString().slice(-4)}`;
+  const cleanName = newClass.name.trim();
+  const gradeMatch = cleanName.match(/(\d+)/);
+  const secMatch = cleanName.match(/[A-Za-zÇĞİÖŞÜçğıöşü]/g);
+  const gradeLevel = Number(newClass.gradeLevel) || (gradeMatch ? parseInt(gradeMatch[1], 10) : 9);
+  const branch = newClass.branch || (secMatch && secMatch.length > 0 ? secMatch[secMatch.length - 1].toUpperCase() : 'A');
+
+  const classItem = {
+    id: classId,
+    name: cleanName,
+    gradeLevel,
+    branch,
+    section: newClass.section || branch,
+    academicYear: newClass.academicYear || '2026-2027',
+    advisorTeacher: newClass.advisorTeacher || undefined,
+    advisorTeacherId: newClass.advisorTeacherId || undefined,
+    capacity: Number(newClass.capacity) || 34,
+    studentCount: Number(newClass.studentCount) || 0
+  };
+
+  // 1. Write to Supabase relational table
+  const { client } = getSupabaseInfo();
+  if (client) {
+    try {
+      const classUuid = toValidUuid(classItem.id || classItem.name);
+      await client.from('classes').upsert({
+        id: classUuid,
+        name: classItem.name,
+        grade_level: String(classItem.gradeLevel),
+        teacher_id: classItem.advisorTeacherId ? toValidUuid(classItem.advisorTeacherId) : null
+      });
+    } catch (err) {
+      console.warn('[Supabase add class error]:', err);
+    }
+  }
+
+  // 2. Update server state
+  if (!inMemoryLatestState) {
+    inMemoryLatestState = { users: [], classes: [], homeworks: [], submissions: [], grades: [], attendance: [], announcements: [] };
+  }
+  if (!Array.isArray(inMemoryLatestState.classes)) {
+    inMemoryLatestState.classes = [];
+  }
+  const existingIndex = inMemoryLatestState.classes.findIndex((c: any) => c.id === classItem.id || c.name === classItem.name);
+  if (existingIndex >= 0) {
+    inMemoryLatestState.classes[existingIndex] = classItem;
+  } else {
+    inMemoryLatestState.classes.push(classItem);
+  }
+
+  savePersistedState(inMemoryLatestState);
+  broadcastStateUpdate(inMemoryLatestState);
+
+  return res.json({ success: true, class: classItem });
+});
+
+app.put('/api/classes/:id', async (req, res) => {
+  const { id } = req.params;
+  const updates = req.body;
+  const { client } = getSupabaseInfo();
+
+  if (client) {
+    try {
+      const classUuid = toValidUuid(id);
+      await client.from('classes').update({
+        name: updates.name,
+        grade_level: updates.gradeLevel ? String(updates.gradeLevel) : undefined,
+        teacher_id: updates.advisorTeacherId ? toValidUuid(updates.advisorTeacherId) : undefined
+      }).or(`id.eq.${classUuid},id.eq.${id},name.eq.${id}`);
+    } catch (err) {
+      console.warn('[Supabase update class error]:', err);
+    }
+  }
+
+  let updatedItem: any = null;
+  if (inMemoryLatestState && Array.isArray(inMemoryLatestState.classes)) {
+    const idx = inMemoryLatestState.classes.findIndex((c: any) => c.id === id || c.name === id);
+    if (idx >= 0) {
+      inMemoryLatestState.classes[idx] = { ...inMemoryLatestState.classes[idx], ...updates };
+      updatedItem = inMemoryLatestState.classes[idx];
+    }
+  }
+
+  if (!updatedItem) {
+    const disk = loadPersistedState();
+    if (disk && Array.isArray(disk.classes)) {
+      const idx = disk.classes.findIndex((c: any) => c.id === id || c.name === id);
+      if (idx >= 0) {
+        disk.classes[idx] = { ...disk.classes[idx], ...updates };
+        updatedItem = disk.classes[idx];
+        inMemoryLatestState = disk;
+      }
+    }
+  }
+
+  if (inMemoryLatestState) {
+    savePersistedState(inMemoryLatestState);
+    broadcastStateUpdate(inMemoryLatestState);
+  }
+
+  return res.json({ success: true, class: updatedItem });
+});
+
+app.delete('/api/classes/:id', async (req, res) => {
+  const { id } = req.params;
+  const { client } = getSupabaseInfo();
+
+  if (client) {
+    try {
+      const classUuid = toValidUuid(id);
+      await client.from('classes').delete().or(`id.eq.${classUuid},id.eq.${id},name.eq.${id}`);
+    } catch (err) {
+      console.warn('[Supabase delete class error]:', err);
+    }
+  }
+
+  if (inMemoryLatestState && Array.isArray(inMemoryLatestState.classes)) {
+    inMemoryLatestState.classes = inMemoryLatestState.classes.filter((c: any) => c.id !== id && c.name !== id);
+  }
+
+  const disk = loadPersistedState();
+  if (disk && Array.isArray(disk.classes)) {
+    disk.classes = disk.classes.filter((c: any) => c.id !== id && c.name !== id);
+    inMemoryLatestState = disk;
+    savePersistedState(disk);
+  }
+
+  if (inMemoryLatestState) {
+    broadcastStateUpdate(inMemoryLatestState);
+  }
+
+  return res.json({ success: true });
+});
+
+// ================= HOMEWORK / ASSIGNMENT API ENDPOINTS =================
+app.get('/api/homeworks', async (req, res) => {
+  const { classGrade, teacherId, studentId } = req.query as Record<string, string>;
+  const { client } = getSupabaseInfo();
+
+  if (!inMemoryLatestState || !Array.isArray(inMemoryLatestState.homeworks) || inMemoryLatestState.homeworks.length === 0) {
+    if (client) {
+      try {
+        const { data: backup } = await client
+          .from('school_backups')
+          .select('payload')
+          .order('created_at', { ascending: false })
+          .limit(1)
+          .single();
+        if (backup?.payload?.homeworks && Array.isArray(backup.payload.homeworks) && backup.payload.homeworks.length > 0) {
+          if (!inMemoryLatestState) inMemoryLatestState = backup.payload;
+          else inMemoryLatestState.homeworks = backup.payload.homeworks;
+        }
+      } catch {}
+
+      // If still empty, query relational assignments table directly
+      if (!inMemoryLatestState?.homeworks || inMemoryLatestState.homeworks.length === 0) {
+        try {
+          const { data: dbAssignments } = await client
+            .from('assignments')
+            .select('*')
+            .order('created_at', { ascending: false });
+
+          if (dbAssignments && dbAssignments.length > 0) {
+            const mappedHw = dbAssignments.map((a: any) => ({
+              id: a.id,
+              title: a.title,
+              subject: a.subject || 'Ders',
+              description: a.description || '',
+              targetClass: a.target_class || 'Tüm Okul',
+              targetClasses: a.target_classes || null,
+              targetType: a.target_type || 'class',
+              targetStudentIds: a.target_student_ids || null,
+              teacherId: a.teacher_id,
+              dueDate: a.due_date ? a.due_date.split('T')[0] : '',
+              dueTime: a.due_time || '23:59',
+              maxScore: a.max_score || 100,
+              xpReward: a.xp_reward || 50,
+              attachments: a.attachments || [],
+              rubric: a.rubric || [],
+              createdAt: a.created_at
+            }));
+
+            if (!inMemoryLatestState) {
+              inMemoryLatestState = { users: [], classes: [], homeworks: [], submissions: [], grades: [], attendance: [], announcements: [] };
+            }
+            inMemoryLatestState.homeworks = mappedHw;
+          }
+        } catch {}
+      }
+    }
+  }
+
+  let homeworks: any[] = inMemoryLatestState?.homeworks || [];
+
+  if (teacherId) {
+    homeworks = homeworks.filter(h => h.teacherId === teacherId);
+  }
+  if (classGrade) {
+    const cleanNorm = normalizeServerClassName(classGrade);
+    homeworks = homeworks.filter(h => {
+      if (isAllSchoolServer(h.targetClass)) return true;
+      if (h.targetClasses && h.targetClasses.some((tc: string) => isAllSchoolServer(tc) || normalizeServerClassName(tc) === cleanNorm)) return true;
+      if (h.targetClass) {
+        const parts = h.targetClass.split(',').map((p: string) => p.trim());
+        if (parts.some((p: string) => isAllSchoolServer(p) || normalizeServerClassName(p) === cleanNorm)) return true;
+      }
+      return false;
+    });
+  }
+  if (studentId) {
+    homeworks = homeworks.filter(h => 
+      !h.targetType || h.targetType === 'class' || 
+      (h.targetStudentIds && h.targetStudentIds.includes(studentId))
+    );
+  }
+
+  res.json({ success: true, homeworks });
+});
+
+app.post('/api/homeworks', async (req, res) => {
+  const newHw = req.body;
+  if (!newHw || !newHw.title) {
+    return res.status(400).json({ success: false, message: 'Ödev başlığı zorunludur' });
+  }
+
+  const hwId = newHw.id || `hw-${Date.now()}`;
+  const record = {
+    ...newHw,
+    id: hwId,
+    createdAt: newHw.createdAt || new Date().toISOString()
+  };
+
+  if (!inMemoryLatestState) {
+    inMemoryLatestState = { users: [], classes: [], homeworks: [], submissions: [], grades: [], attendance: [], announcements: [] };
+  }
+  if (!Array.isArray(inMemoryLatestState.homeworks)) inMemoryLatestState.homeworks = [];
+
+  const existingIdx = inMemoryLatestState.homeworks.findIndex((h: any) => h.id === hwId);
+  if (existingIdx >= 0) {
+    inMemoryLatestState.homeworks[existingIdx] = record;
+  } else {
+    inMemoryLatestState.homeworks.unshift(record);
+  }
+
+  // Sync with Supabase assignments table if client available
+  const { client } = getSupabaseInfo();
+  if (client) {
+    try {
+      const hwUuid = toValidUuid(record.id);
+      const teacherUuid = record.teacherId ? toValidUuid(record.teacherId) : toValidUuid('admin-root-tlogix');
+
+      try {
+        await client.from('profiles').upsert({
+          id: teacherUuid,
+          email: record.teacherEmail || `${(record.teacherName || 'ogretmen').toLowerCase().replace(/\s+/g, '.')}@gnsial.meb.k12.tr`,
+          full_name: record.teacherName || 'Öğretmen',
+          role: 'teacher'
+        }, { onConflict: 'id' });
+      } catch {}
+
+      await client.from('assignments').upsert({
+        id: hwUuid,
+        title: record.title,
+        subject: record.subject || 'Genel',
+        description: record.description || `${record.subject || 'Ders'} ödevi`,
+        target_class: record.targetClass || 'Tüm Okul',
+        target_classes: record.targetClasses || null,
+        target_type: record.targetType || 'class',
+        target_student_ids: record.targetStudentIds ? record.targetStudentIds.map(toValidUuid) : null,
+        teacher_id: teacherUuid,
+        due_date: record.dueDate ? new Date(record.dueDate).toISOString() : new Date(Date.now() + 86400000 * 7).toISOString(),
+        due_time: record.dueTime || '23:59',
+        max_score: record.maxScore || 100,
+        xp_reward: record.xpReward || 50,
+        attachments: record.attachments || [],
+        rubric: record.rubric || [],
+        created_at: record.createdAt || new Date().toISOString()
+      }, { onConflict: 'id' });
+
+      // Persist state snapshot to school_backups
+      await client.from('school_backups').insert({
+        backup_type: 'homework_create',
+        stats: {
+          totalHomeworks: inMemoryLatestState.homeworks.length,
+          totalUsers: inMemoryLatestState.users?.length || 0
+        },
+        payload: inMemoryLatestState,
+        created_at: new Date().toISOString()
+      });
+    } catch (e: any) {
+      console.warn('[Supabase Homework Create Warn]:', e.message);
+    }
+  }
+
+  savePersistedState(inMemoryLatestState);
+  broadcastStateUpdate(inMemoryLatestState);
+  res.json({ success: true, homework: record });
+});
+
+app.put('/api/homeworks/:id', async (req, res) => {
+  const { id } = req.params;
+  const updates = req.body;
+  if (!inMemoryLatestState || !Array.isArray(inMemoryLatestState.homeworks)) {
+    return res.status(404).json({ success: false, message: 'Ödev bulunamadı' });
+  }
+
+  const idx = inMemoryLatestState.homeworks.findIndex((h: any) => h.id === id);
+  if (idx < 0) {
+    return res.status(404).json({ success: false, message: 'Ödev bulunamadı' });
+  }
+
+  const updatedHw = { ...inMemoryLatestState.homeworks[idx], ...updates, updatedAt: new Date().toISOString() };
+  inMemoryLatestState.homeworks[idx] = updatedHw;
+
+  // Supabase update
+  const { client } = getSupabaseInfo();
+  if (client) {
+    try {
+      const hwUuid = toValidUuid(id);
+      await client.from('assignments').update({
+        title: updatedHw.title,
+        subject: updatedHw.subject,
+        description: updatedHw.description,
+        target_class: updatedHw.targetClass,
+        target_classes: updatedHw.targetClasses || null,
+        target_type: updatedHw.targetType,
+        target_student_ids: updatedHw.targetStudentIds ? updatedHw.targetStudentIds.map(toValidUuid) : null,
+        due_date: updatedHw.dueDate ? new Date(updatedHw.dueDate).toISOString() : null,
+        due_time: updatedHw.dueTime,
+        max_score: updatedHw.maxScore,
+        xp_reward: updatedHw.xpReward,
+        attachments: updatedHw.attachments || [],
+        rubric: updatedHw.rubric || [],
+        updated_at: new Date().toISOString()
+      }).eq('id', hwUuid);
+
+      await client.from('school_backups').insert({
+        backup_type: 'homework_update',
+        stats: { totalHomeworks: inMemoryLatestState.homeworks.length },
+        payload: inMemoryLatestState,
+        created_at: new Date().toISOString()
+      });
+    } catch (e: any) {
+      console.warn('[Supabase Homework Update Warn]:', e.message);
+    }
+  }
+
+  savePersistedState(inMemoryLatestState);
+  broadcastStateUpdate(inMemoryLatestState);
+  res.json({ success: true, homework: updatedHw });
+});
+
+app.delete('/api/homeworks/:id', async (req, res) => {
+  const { id } = req.params;
+  if (inMemoryLatestState && Array.isArray(inMemoryLatestState.homeworks)) {
+    inMemoryLatestState.homeworks = inMemoryLatestState.homeworks.filter((h: any) => h.id !== id);
+    if (Array.isArray(inMemoryLatestState.submissions)) {
+      inMemoryLatestState.submissions = inMemoryLatestState.submissions.filter((s: any) => s.homeworkId !== id);
+    }
+  }
+
+  const { client } = getSupabaseInfo();
+  if (client) {
+    try {
+      const hwUuid = toValidUuid(id);
+      await client.from('assignment_submissions').delete().eq('assignment_id', hwUuid);
+      await client.from('assignments').delete().eq('id', hwUuid);
+
+      if (inMemoryLatestState) {
+        await client.from('school_backups').insert({
+          backup_type: 'homework_delete',
+          stats: { totalHomeworks: inMemoryLatestState.homeworks?.length || 0 },
+          payload: inMemoryLatestState,
+          created_at: new Date().toISOString()
+        });
+      }
+    } catch {}
+  }
+
+  if (inMemoryLatestState) {
+    savePersistedState(inMemoryLatestState);
+    broadcastStateUpdate(inMemoryLatestState);
+  }
+  res.json({ success: true, message: 'Ödev silindi' });
+});
+
+app.get('/api/submissions', async (req, res) => {
+  const store = inMemoryLatestState;
+  const submissions = store?.submissions || [];
+  res.json({ success: true, submissions });
+});
+
+app.get('/api/homeworks/:id/submissions', async (req, res) => {
+  const { id } = req.params;
+  const store = inMemoryLatestState;
+  const submissions = (store?.submissions || []).filter((s: any) => s.homeworkId === id);
+  res.json({ success: true, submissions });
+});
+
+app.post('/api/homeworks/:id/submissions/status', async (req, res) => {
+  const { id } = req.params;
+  const { submissionId, studentId, status, score, feedback, rubricScores, teacherName } = req.body;
+
+  if (!inMemoryLatestState) {
+    inMemoryLatestState = { users: [], classes: [], homeworks: [], submissions: [], grades: [], attendance: [], announcements: [] };
+  }
+  if (!Array.isArray(inMemoryLatestState.submissions)) inMemoryLatestState.submissions = [];
+
+  let sub = inMemoryLatestState.submissions.find((s: any) => 
+    (submissionId && s.id === submissionId) || (s.homeworkId === id && s.studentId === studentId)
+  );
+
+  const nowIso = new Date().toISOString();
+  if (sub) {
+    sub.status = status;
+    if (score !== undefined) sub.score = score;
+    if (feedback !== undefined) sub.feedback = feedback;
+    if (rubricScores !== undefined) sub.rubricScores = rubricScores;
+    if (teacherName) sub.gradedByTeacher = teacherName;
+    sub.gradedAt = nowIso;
+  } else {
+    sub = {
+      id: submissionId || `sub-${id}-${studentId || Date.now()}`,
+      homeworkId: id,
+      studentId: studentId || '',
+      status: status || 'pending',
+      score,
+      feedback,
+      rubricScores,
+      gradedByTeacher: teacherName,
+      gradedAt: nowIso
+    };
+    inMemoryLatestState.submissions.push(sub);
+  }
+
+  // Supabase update
+  const { client } = getSupabaseInfo();
+  if (client && sub.studentId) {
+    try {
+      // 1. Ensure assignment exists in Supabase
+      const hw = inMemoryLatestState.homeworks?.find((h: any) => h.id === id);
+      if (hw) {
+        try {
+          await client.from('assignments').upsert({
+            id: toValidUuid(hw.id),
+            title: hw.title || 'Ödev',
+            subject: hw.subject || 'Ders',
+            description: hw.description || '',
+            created_at: hw.createdAt || nowIso,
+            updated_at: nowIso
+          }, { onConflict: 'id' });
+        } catch (err: any) {
+          console.warn('[Supabase Homework Upsert Warn]:', err?.message);
+        }
+      }
+
+      // 2. Ensure student exists in Supabase
+      const st = inMemoryLatestState.users?.find((u: any) => u.uid === sub.studentId);
+      try {
+        await client.from('students').upsert({
+          id: toValidUuid(sub.studentId),
+          full_name: sub.studentName || st?.displayName || 'Öğrenci',
+          school_number: sub.schoolNumber || st?.schoolNumber || null,
+          updated_at: nowIso
+        }, { onConflict: 'id' });
+      } catch {}
+
+      // 3. Upsert submission
+      const subResult = await client.from('assignment_submissions').upsert({
+        id: toValidUuid(sub.id),
+        assignment_id: toValidUuid(id),
+        student_id: toValidUuid(sub.studentId),
+        status: sub.status === 'completed' ? 'completed' : 'pending',
+        score: sub.score !== undefined ? sub.score : null,
+        feedback: sub.feedback || null,
+        rubric_scores: sub.rubricScores || [],
+        updated_at: nowIso
+      }, { onConflict: 'id' });
+
+      if (subResult.error) {
+        console.error('[Supabase Submissions Status Error]:', subResult.error.message);
+        recordSystemError({
+          message: `Supabase ödev değerlendirme yazma hatası: ${subResult.error.message}`,
+          category: 'database',
+          severity: 'error',
+          source: 'POST /api/homeworks/:id/submissions/status',
+          metadata: { homeworkId: id, studentId: sub.studentId, error: subResult.error }
+        });
+      }
+
+      try {
+        await client.from('school_backups').insert({
+          backup_type: 'submission_status',
+          stats: { totalSubmissions: inMemoryLatestState.submissions.length },
+          payload: inMemoryLatestState,
+          created_at: nowIso
+        });
+      } catch {}
+    } catch (err: any) {
+      console.error('[Supabase Submission Status Exception]:', err);
+      recordSystemError({
+        message: `Ödev durumu güncellenirken istisna: ${err?.message || err}`,
+        category: 'database',
+        severity: 'warn',
+        source: 'POST /api/homeworks/:id/submissions/status',
+        stack: err?.stack,
+        metadata: { homeworkId: id, studentId: sub.studentId }
+      });
+    }
+  }
+
+  savePersistedState(inMemoryLatestState);
+  broadcastStateUpdate(inMemoryLatestState);
+  res.json({ success: true, submission: sub });
+});
+
+// ================= HOMEWORK SUBMISSION FILE UPLOAD & STREAMING (VIDEO / IMAGE / DOCS) =================
+app.post('/api/uploads/homework-submission', async (req, res) => {
+  try {
+    const { homeworkId, studentId, fileName, fileType, fileSize, fileData } = req.body;
+    if (!fileData) {
+      return res.status(400).json({ success: false, message: 'Dosya verisi (fileData) zorunludur.' });
+    }
+
+    ensureUploadsDir();
+
+    let buffer: Buffer;
+    let mimeType = fileType || 'application/octet-stream';
+    if (typeof fileData === 'string' && fileData.includes(';base64,')) {
+      const parts = fileData.split(';base64,');
+      const mimeMatch = parts[0].match(/data:(.*?)$/);
+      if (mimeMatch && mimeMatch[1]) {
+        mimeType = mimeMatch[1];
+      }
+      buffer = Buffer.from(parts[1], 'base64');
+    } else if (Buffer.isBuffer(fileData)) {
+      buffer = fileData;
+    } else {
+      buffer = Buffer.from(String(fileData), 'base64');
+    }
+
+    const safeExt = getSafeFileExtension(fileName || 'file', mimeType);
+    const fileId = `subfile_${Date.now()}_${crypto.randomBytes(6).toString('hex')}`;
+    const storedFileName = `${fileId}${safeExt}`;
+    const filePath = path.join(UPLOADS_DIR, storedFileName);
+
+    fs.writeFileSync(filePath, buffer);
+
+    const detectedType = getAttachmentType(mimeType, fileName || storedFileName);
+    const byteSize = buffer.length;
+    const formattedSize = byteSize > 1024 * 1024 
+      ? `${(byteSize / (1024 * 1024)).toFixed(1)} MB`
+      : `${Math.round(byteSize / 1024)} KB`;
+
+    const meta = loadUploadsMeta();
+    meta[fileId] = {
+      id: fileId,
+      storedFileName,
+      originalName: fileName || 'Dosya',
+      mimeType,
+      type: detectedType,
+      byteSize,
+      formattedSize,
+      homeworkId: homeworkId || '',
+      studentId: studentId || '',
+      createdAt: new Date().toISOString()
+    };
+    saveUploadsMeta(meta);
+
+    console.log(`[Uploads] Yeni ödev yanıt dosyası veritabanına kaydedildi: ${fileName} (${formattedSize}, ${detectedType}) -> ${fileId}`);
+
+    return res.json({
+      success: true,
+      attachment: {
+        id: fileId,
+        name: fileName || 'Dosya',
+        size: formattedSize,
+        type: detectedType,
+        url: `/api/files/${fileId}`,
+        uploadedAt: new Date().toISOString()
+      }
+    });
+  } catch (err: any) {
+    console.error('[Uploads Error]:', err);
+    return res.status(500).json({
+      success: false,
+      message: `Dosya veritabanına kaydedilirken hata oluştu: ${err?.message || err}`
+    });
+  }
+});
+
+// Stream / serve files from database uploads directory with Range support for video scrubbing
+app.get('/api/files/:fileId', (req, res) => {
+  const { fileId } = req.params;
+  const meta = loadUploadsMeta();
+  const fileMeta = meta[fileId];
+
+  let storedFileName = fileMeta?.storedFileName;
+  let mimeType = fileMeta?.mimeType || 'application/octet-stream';
+  let originalName = fileMeta?.originalName || 'file';
+
+  // If not found directly in meta, search UPLOADS_DIR by prefix
+  if (!storedFileName) {
+    try {
+      ensureUploadsDir();
+      const files = fs.readdirSync(UPLOADS_DIR);
+      const match = files.find(f => f.startsWith(fileId));
+      if (match) {
+        storedFileName = match;
+        const ext = path.extname(match).toLowerCase();
+        if (ext === '.mp4') mimeType = 'video/mp4';
+        else if (ext === '.webm') mimeType = 'video/webm';
+        else if (ext === '.mov') mimeType = 'video/quicktime';
+        else if (ext === '.jpg' || ext === '.jpeg') mimeType = 'image/jpeg';
+        else if (ext === '.png') mimeType = 'image/png';
+        else if (ext === '.webp') mimeType = 'image/webp';
+        else if (ext === '.pdf') mimeType = 'application/pdf';
+      }
+    } catch {}
+  }
+
+  if (!storedFileName) {
+    return res.status(404).send('Dosya veritabanında bulunamadı');
+  }
+
+  const filePath = path.join(UPLOADS_DIR, storedFileName);
+  if (!fs.existsSync(filePath)) {
+    return res.status(404).send('Dosya bulunamadı');
+  }
+
+  const stat = fs.statSync(filePath);
+  const fileSize = stat.size;
+  const range = req.headers.range;
+
+  // Stream video with HTTP 206 Partial Content for video seeking/playback
+  if (range && mimeType.startsWith('video/')) {
+    const parts = range.replace(/bytes=/, '').split('-');
+    const start = parseInt(parts[0], 10);
+    const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+    const chunksize = (end - start) + 1;
+    const file = fs.createReadStream(filePath, { start, end });
+    const head = {
+      'Content-Range': `bytes ${start}-${end}/${fileSize}`,
+      'Accept-Ranges': 'bytes',
+      'Content-Length': chunksize,
+      'Content-Type': mimeType,
+    };
+    res.writeHead(206, head);
+    file.pipe(res);
+    return;
+  }
+
+  res.setHeader('Content-Type', mimeType);
+  res.setHeader('Content-Length', fileSize);
+  res.setHeader('Content-Disposition', `inline; filename="${encodeURIComponent(originalName)}"`);
+  res.setHeader('Cache-Control', 'public, max-age=86400');
+
+  const stream = fs.createReadStream(filePath);
+  stream.pipe(res);
+});
+
+app.post('/api/homeworks/:id/submit', async (req, res) => {
+  const { id } = req.params;
+  const { studentId, studentNote, attachments, studentName, schoolNumber, classGrade } = req.body;
+
+  if (!studentId) {
+    recordSystemError({
+      message: 'Ödev tesliminde eksik kimlik doğrulama: studentId parametresi boş gönderildi.',
+      category: 'auth',
+      severity: 'error',
+      source: 'POST /api/homeworks/:id/submit',
+      metadata: { homeworkId: id, body: req.body }
+    });
+    return res.status(400).json({ success: false, message: 'Öğrenci kimlik bilgisi (studentId) zorunludur.' });
+  }
+
+  if (!inMemoryLatestState) {
+    inMemoryLatestState = { users: [], classes: [], homeworks: [], submissions: [], grades: [], attendance: [], announcements: [] };
+  }
+  if (!Array.isArray(inMemoryLatestState.submissions)) inMemoryLatestState.submissions = [];
+
+  let sub = inMemoryLatestState.submissions.find((s: any) => s.homeworkId === id && s.studentId === studentId);
+  const nowIso = new Date().toISOString();
+
+  // Safely persist any direct base64 attachments to database uploads directory without truncation
+  const safeAttachments = Array.isArray(attachments) ? attachments.map((att: any) => {
+    let finalUrl = att.url || '#';
+    // If raw base64 data URL was provided, save directly to database disk storage
+    if (typeof finalUrl === 'string' && finalUrl.startsWith('data:')) {
+      try {
+        ensureUploadsDir();
+        const parts = finalUrl.split(';base64,');
+        const mimeMatch = parts[0].match(/data:(.*?)$/);
+        const mimeType = mimeMatch ? mimeMatch[1] : (att.type === 'video' ? 'video/mp4' : 'application/octet-stream');
+        const buffer = Buffer.from(parts[1], 'base64');
+        const safeExt = getSafeFileExtension(att.name || 'file', mimeType);
+        const fileId = `subfile_${Date.now()}_${crypto.randomBytes(6).toString('hex')}`;
+        const storedFileName = `${fileId}${safeExt}`;
+        fs.writeFileSync(path.join(UPLOADS_DIR, storedFileName), buffer);
+        const detectedType = getAttachmentType(mimeType, att.name || storedFileName);
+        const meta = loadUploadsMeta();
+        meta[fileId] = {
+          id: fileId,
+          storedFileName,
+          originalName: att.name || 'Dosya',
+          mimeType,
+          type: detectedType,
+          byteSize: buffer.length,
+          homeworkId: id,
+          studentId,
+          createdAt: nowIso
+        };
+        saveUploadsMeta(meta);
+        finalUrl = `/api/files/${fileId}`;
+      } catch (e) {
+        console.warn('[Direct base64 save note]:', e);
+      }
+    }
+
+    return {
+      id: att.id || `att-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+      name: att.name || 'Dokuman',
+      size: att.size || 'Belirtilmedi',
+      type: att.type || 'file',
+      url: finalUrl,
+      uploadedAt: att.uploadedAt || nowIso
+    };
+  }) : [];
+
+  if (sub) {
+    sub.status = 'completed';
+    sub.submittedAt = nowIso;
+    sub.studentNote = studentNote || sub.studentNote;
+    if (safeAttachments.length > 0) {
+      sub.attachments = safeAttachments;
+    }
+  } else {
+    sub = {
+      id: `sub-${id}-${studentId}`,
+      homeworkId: id,
+      studentId,
+      studentName: studentName || 'Öğrenci',
+      schoolNumber: schoolNumber || '',
+      classGrade: classGrade || '',
+      status: 'completed',
+      submittedAt: nowIso,
+      studentNote: studentNote || '',
+      attachments: safeAttachments
+    };
+    inMemoryLatestState.submissions.push(sub);
+  }
+
+  // Supabase update with foreign key validation
+  const { client } = getSupabaseInfo();
+  if (client && studentId) {
+    try {
+      // 1. Ensure target assignment row exists in Supabase
+      const hw = inMemoryLatestState.homeworks?.find((h: any) => h.id === id);
+      if (hw) {
+        try {
+          await client.from('assignments').upsert({
+            id: toValidUuid(hw.id),
+            title: hw.title || 'Ödev',
+            subject: hw.subject || 'Ders',
+            description: hw.description || '',
+            created_at: hw.createdAt || nowIso,
+            updated_at: nowIso
+          }, { onConflict: 'id' });
+        } catch (err: any) {
+          console.warn('[Supabase Homework Upsert Warn]:', err?.message);
+        }
+      }
+
+      // 2. Ensure target student row exists in Supabase
+      const st = inMemoryLatestState.users?.find((u: any) => u.uid === studentId);
+      try {
+        await client.from('students').upsert({
+          id: toValidUuid(studentId),
+          full_name: studentName || st?.displayName || 'Öğrenci',
+          school_number: schoolNumber || st?.schoolNumber || null,
+          updated_at: nowIso
+        }, { onConflict: 'id' });
+      } catch {}
+
+      try {
+        await client.from('profiles').upsert({
+          id: toValidUuid(studentId),
+          full_name: studentName || st?.displayName || 'Öğrenci',
+          role: 'student',
+          school_number: schoolNumber || st?.schoolNumber || null,
+          class_name: classGrade || st?.classGrade || null,
+          updated_at: nowIso
+        }, { onConflict: 'id' });
+      } catch {}
+
+      // 3. Upsert submission with multiple column name fallbacks
+      const subResult = await client.from('assignment_submissions').upsert({
+        id: toValidUuid(sub.id),
+        assignment_id: toValidUuid(id),
+        student_id: toValidUuid(studentId),
+        status: 'completed',
+        submitted_at: nowIso,
+        student_note: studentNote || null,
+        notes: studentNote || null,
+        attachments: sub.attachments || [],
+        updated_at: nowIso
+      }, { onConflict: 'id' });
+
+      if (subResult.error) {
+        console.error('[Supabase Submissions Error]:', subResult.error.message);
+        recordSystemError({
+          message: `Supabase ödev teslim yazma hatası: ${subResult.error.message}`,
+          category: 'database',
+          severity: 'error',
+          source: 'POST /api/homeworks/:id/submit',
+          userId: studentId,
+          metadata: { homeworkId: id, studentId, error: subResult.error }
+        });
+      }
+
+      try {
+        await client.from('school_backups').insert({
+          backup_type: 'submission_submit',
+          stats: { totalSubmissions: inMemoryLatestState.submissions.length },
+          payload: inMemoryLatestState,
+          created_at: nowIso
+        });
+      } catch {}
+    } catch (dbErr: any) {
+      console.error('[Supabase Submission Exception]:', dbErr);
+      recordSystemError({
+        message: `Ödev tesliminde veritabanı yazma istisnası: ${dbErr?.message || dbErr}`,
+        category: 'database',
+        severity: 'error',
+        source: 'POST /api/homeworks/:id/submit',
+        userId: studentId,
+        stack: dbErr?.stack,
+        metadata: { homeworkId: id, studentId }
+      });
+    }
+  }
+
+  savePersistedState(inMemoryLatestState);
+  broadcastStateUpdate(inMemoryLatestState);
+  res.json({ success: true, submission: sub });
+});
+
+// ================= DUYURULAR (ANNOUNCEMENTS) ENDPOINTS =================
+app.get('/api/announcements', async (req, res) => {
+  const store = inMemoryLatestState;
+  const announcements = store?.announcements || [];
+  res.json({ success: true, announcements });
+});
+
+app.post('/api/announcements', async (req, res) => {
+  const record = req.body;
+  if (!record || !record.id) {
+    return res.status(400).json({ success: false, message: 'Geçersiz duyuru verisi' });
+  }
+
+  if (!inMemoryLatestState) {
+    inMemoryLatestState = { users: [], classes: [], homeworks: [], submissions: [], grades: [], attendance: [], announcements: [] };
+  }
+  if (!Array.isArray(inMemoryLatestState.announcements)) {
+    inMemoryLatestState.announcements = [];
+  }
+
+  const existingIdx = inMemoryLatestState.announcements.findIndex((a: any) => a.id === record.id);
+  if (existingIdx >= 0) {
+    inMemoryLatestState.announcements[existingIdx] = {
+      ...inMemoryLatestState.announcements[existingIdx],
+      ...record,
+      updatedAt: new Date().toISOString()
+    };
+  } else {
+    inMemoryLatestState.announcements.unshift({
+      ...record,
+      createdAt: record.createdAt || new Date().toISOString()
+    });
+  }
+
+  // Supabase update if client available
+  const { client } = getSupabaseInfo();
+  if (client) {
+    try {
+      await client.from('school_backups').insert({
+        backup_type: 'announcement_save',
+        stats: { totalAnnouncements: inMemoryLatestState.announcements.length },
+        payload: inMemoryLatestState,
+        created_at: new Date().toISOString()
+      });
+    } catch (e: any) {
+      console.warn('[Supabase Announcement Save Warn]:', e.message);
+    }
+  }
+
+  savePersistedState(inMemoryLatestState);
+  broadcastStateUpdate(inMemoryLatestState);
+  res.json({ success: true, announcement: record });
+});
+
+app.delete('/api/announcements/:id', async (req, res) => {
+  const { id } = req.params;
+  if (inMemoryLatestState && Array.isArray(inMemoryLatestState.announcements)) {
+    inMemoryLatestState.announcements = inMemoryLatestState.announcements.filter((a: any) => a.id !== id);
+  }
+
+  const { client } = getSupabaseInfo();
+  if (client && inMemoryLatestState) {
+    try {
+      await client.from('school_backups').insert({
+        backup_type: 'announcement_delete',
+        stats: { totalAnnouncements: inMemoryLatestState.announcements?.length || 0 },
+        payload: inMemoryLatestState,
+        created_at: new Date().toISOString()
+      });
+    } catch {}
+  }
+
+  if (inMemoryLatestState) {
+    savePersistedState(inMemoryLatestState);
+    broadcastStateUpdate(inMemoryLatestState);
+  }
+  res.json({ success: true, message: 'Duyuru silindi' });
+});
+
+app.post('/api/announcements/:id/pin', async (req, res) => {
+  const { id } = req.params;
+  if (inMemoryLatestState && Array.isArray(inMemoryLatestState.announcements)) {
+    const ann = inMemoryLatestState.announcements.find((a: any) => a.id === id);
+    if (ann) {
+      ann.pinned = !ann.pinned;
+      ann.updatedAt = new Date().toISOString();
+      savePersistedState(inMemoryLatestState);
+      broadcastStateUpdate(inMemoryLatestState);
+      return res.json({ success: true, pinned: ann.pinned });
+    }
+  }
+  res.status(404).json({ success: false, message: 'Duyuru bulunamadı' });
+});
+
+// ================= SYSTEM ERROR MONITORING ENDPOINTS =================
+app.get('/api/system-logs', (req, res) => {
+  res.json({ success: true, logs: inMemorySystemLogs });
+});
+
+app.post('/api/system-logs', (req, res) => {
+  const body = req.body;
+  if (!body || !body.message) {
+    return res.status(400).json({ success: false, message: 'Hata mesajı gereklidir' });
+  }
+
+  const log = recordSystemError({
+    message: body.message,
+    category: body.category,
+    severity: body.severity,
+    source: body.source,
+    stack: body.stack,
+    userId: body.userId,
+    userRole: body.userRole,
+    path: body.path,
+    metadata: body.metadata
+  });
+
+  res.json({ success: true, log });
+});
+
+app.delete('/api/system-logs', (req, res) => {
+  inMemorySystemLogs = [];
+  saveSystemLogs(inMemorySystemLogs);
+  res.json({ success: true, message: 'Tüm sistem hata logları temizlendi' });
+});
+
+app.all('/api/*', (req, res) => {
+  res.status(404).json({
+    error: `API uç noktası bulunamadı: ${req.method} ${req.path}`,
+    status: 'not_found'
+  });
+});
+
+app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+  if (req.path.startsWith('/api')) {
+    console.error('[Server API Error Handler]:', err);
+    recordSystemError({
+      message: `API Hatası: ${req.method} ${req.path} -> ${err?.message || 'Bilinmeyen hata'}`,
+      category: req.path.includes('homework') ? 'homework' : 'runtime',
+      severity: 'error',
+      source: `${req.method} ${req.path}`,
+      stack: err?.stack
+    });
+    return res.status(500).json({
+      error: err?.message || 'Sunucu içi API hatası oluştu.',
+      status: 'error'
+    });
+  }
+  next(err);
+});
+
+async function startServer() {
+  if (process.env.NODE_ENV !== 'production') {
+    const vite = await createViteServer({
+      server: {
+        middlewareMode: true,
+        hmr: process.env.DISABLE_HMR !== 'true' ? undefined : false,
+      },
+      appType: 'spa',
+    });
+    app.use(vite.middlewares);
+  } else {
+    const distPath = path.join(process.cwd(), 'dist');
+    app.use(express.static(distPath));
+    app.get('*', (req, res) => {
+      res.sendFile(path.join(distPath, 'index.html'));
+    });
+  }
+
+  const server = app.listen(PORT, '0.0.0.0', () => {
+    console.log(`[Server] GNSİAL OYS Server running on http://0.0.0.0:${PORT}`);
+  });
+
+  server.on('error', (err: any) => {
+    if (err.code === 'EADDRINUSE') {
+      console.error(`[Server] Port ${PORT} is already in use.`);
+    } else {
+      console.error('[Server Error]:', err);
+    }
+  });
+}
+
+startServer().catch((err) => {
+  console.error('[Server] Failed to start server:', err);
+});

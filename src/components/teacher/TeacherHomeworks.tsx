@@ -1,0 +1,1563 @@
+import React, { useState, useEffect } from 'react';
+import { useAuth } from '../../context/AuthContext';
+import { dataService, normalizeClassName, isAllSchool } from '../../services/dataService';
+import { homeworkService } from '../../services/homeworkService';
+import { Homework, HomeworkSubmission, HomeworkStatus, RubricItem, Attachment, UserProfile, SchoolClass } from '../../types';
+import { 
+  BookOpen, 
+  Plus, 
+  CheckCircle2, 
+  XCircle, 
+  AlertCircle, 
+  Clock, 
+  Calendar, 
+  Users, 
+  Trash2, 
+  FileCheck, 
+  Check, 
+  Download, 
+  X, 
+  Search,
+  Sparkles,
+  MessageSquare,
+  Paperclip,
+  Award,
+  FileText,
+  Sliders,
+  Send,
+  School,
+  UserCheck,
+  GraduationCap,
+  Edit3,
+  Video,
+  Image as ImageIcon,
+  Play,
+  Eye
+} from 'lucide-react';
+import confetti from 'canvas-confetti';
+
+const STANDARD_SUBJECTS = [
+  'Matematik',
+  'Fizik',
+  'Kimya',
+  'Biyoloji',
+  'Türk Dili ve Edebiyatı',
+  'Tarih',
+  'Coğrafya',
+  'Felsefe',
+  'İngilizce',
+  'Almanca',
+  'Din Kültürü ve Ahlak Bilgisi',
+  'Beden Eğitimi ve Spor',
+  'Görsel Sanatlar',
+  'Müzik',
+  'Bilişim Teknolojileri',
+  'Rehberlik',
+  'Genel Proje'
+];
+
+export const TeacherHomeworks: React.FC = () => {
+  const { currentUser } = useAuth();
+  const [classes, setClasses] = useState<SchoolClass[]>(() => dataService.getClasses());
+  const [homeworks, setHomeworks] = useState<Homework[]>(() => homeworkService.getHomeworks());
+  const [allStudents, setAllStudents] = useState<UserProfile[]>(() => dataService.getStudents());
+
+  useEffect(() => {
+    // Bulut (Supabase & Firestore) ile çift yönlü ödev eşitlemesi
+    homeworkService.syncHomeworksFromCloud().then(hwList => {
+      setHomeworks([...hwList]);
+      setClasses([...dataService.getClasses()]);
+      setAllStudents([...dataService.getStudents()]);
+    });
+
+    const unsub = homeworkService.subscribe(() => {
+      setClasses([...dataService.getClasses()]);
+      setHomeworks([...homeworkService.getHomeworks()]);
+      setAllStudents([...dataService.getStudents()]);
+    });
+    return unsub;
+  }, []);
+
+  const [selectedClassFilter, setSelectedClassFilter] = useState<string>('all');
+  const [showCreateModal, setShowCreateModal] = useState(false);
+  const [editingHomework, setEditingHomework] = useState<Homework | null>(null);
+  const [activeTrackingHomework, setActiveTrackingHomework] = useState<Homework | null>(null);
+  const [deleteConfirmHw, setDeleteConfirmHw] = useState<{ id: string; title: string } | null>(null);
+  const [formError, setFormError] = useState<string | null>(null);
+
+  // Form State
+  const [title, setTitle] = useState('');
+  const [subject, setSubject] = useState(currentUser?.branch || 'Matematik');
+  const [description, setDescription] = useState('');
+  
+  // Target Mode: Class or Student
+  const [targetType, setTargetType] = useState<'class' | 'student'>('class');
+  const [selectedClasses, setSelectedClasses] = useState<string[]>(['Tüm Okul']);
+  const [selectedStudentIds, setSelectedStudentIds] = useState<string[]>([]);
+  const [studentSearchQuery, setStudentSearchQuery] = useState('');
+  const [studentClassFilter, setStudentClassFilter] = useState('all');
+
+  const [dueDate, setDueDate] = useState(
+    new Date(Date.now() + 1000 * 60 * 60 * 24 * 4).toISOString().split('T')[0]
+  );
+  const [dueTime, setDueTime] = useState('23:59');
+  const [maxScore, setMaxScore] = useState(100);
+  const [xpReward, setXpReward] = useState(50);
+  
+  // Rubric State
+  const [enableRubric, setEnableRubric] = useState(true);
+  const [rubricItems, setRubricItems] = useState<RubricItem[]>([
+    { id: 'rub-1', title: 'Doğruluk ve Matematiksel Çözüm', maxPoints: 40, description: 'Soruların doğru yöntem ve tam işlem basamakları ile çözülmesi.' },
+    { id: 'rub-2', title: 'Sayfa Düzeni ve Okunabilirlik', maxPoints: 30, description: 'Temiz ve anlaşılır yazı düzeni.' },
+    { id: 'rub-3', title: 'Zamanında ve Eksiksiz Teslim', maxPoints: 30, description: 'Belirlenen tarihten önce tüm soruların bitirilmesi.' }
+  ]);
+
+  const handleOpenCreateModal = () => {
+    setEditingHomework(null);
+    setFormError(null);
+    setTitle('');
+    setDescription('');
+    setSubject(currentUser?.branch || 'Matematik');
+    setTargetType('class');
+    setSelectedClasses(['Tüm Okul']);
+    setSelectedStudentIds([]);
+    setDueDate(new Date(Date.now() + 1000 * 60 * 60 * 24 * 4).toISOString().split('T')[0]);
+    setDueTime('23:59');
+    setMaxScore(100);
+    setXpReward(50);
+    setEnableRubric(true);
+    setShowCreateModal(true);
+  };
+
+  const handleOpenEditModal = (hw: Homework) => {
+    setEditingHomework(hw);
+    setFormError(null);
+    setTitle(hw.title);
+    setDescription(hw.description);
+    setSubject(hw.subject);
+    setTargetType(hw.targetType || 'class');
+    setSelectedClasses(hw.targetClasses || (hw.targetClass ? [hw.targetClass] : ['Tüm Okul']));
+    setSelectedStudentIds(hw.targetStudentIds || []);
+    setDueDate(hw.dueDate);
+    setDueTime(hw.dueTime || '23:59');
+    setMaxScore(hw.maxScore || 100);
+    setXpReward(hw.xpReward || 50);
+    if (hw.rubric && hw.rubric.length > 0) {
+      setRubricItems(hw.rubric);
+      setEnableRubric(true);
+    } else {
+      setEnableRubric(false);
+    }
+    setShowCreateModal(true);
+  };
+
+  // Filtered Homeworks
+  const filteredHomeworks = homeworks.filter(hw => {
+    if (selectedClassFilter === 'all') return true;
+    if (isAllSchool(hw.targetClass)) return true;
+    const cleanFilter = normalizeClassName(selectedClassFilter);
+    if (hw.targetClasses && hw.targetClasses.some(tc => isAllSchool(tc) || normalizeClassName(tc) === cleanFilter)) return true;
+    if (hw.targetClass && hw.targetClass.split(',').some(tc => isAllSchool(tc) || normalizeClassName(tc.trim()) === cleanFilter)) return true;
+    return false;
+  });
+
+  // Class Selection Helpers
+  const handleToggleClass = (className: string) => {
+    if (className === 'Tüm Okul') {
+      setSelectedClasses(['Tüm Okul']);
+      return;
+    }
+    const withoutAll = selectedClasses.filter(c => c !== 'Tüm Okul');
+    if (withoutAll.includes(className)) {
+      const next = withoutAll.filter(c => c !== className);
+      setSelectedClasses(next.length === 0 ? ['Tüm Okul'] : next);
+    } else {
+      setSelectedClasses([...withoutAll, className]);
+    }
+  };
+
+  // Student Selection Helpers
+  const handleToggleStudent = (studentId: string) => {
+    if (selectedStudentIds.includes(studentId)) {
+      setSelectedStudentIds(selectedStudentIds.filter(id => id !== studentId));
+    } else {
+      setSelectedStudentIds([...selectedStudentIds, studentId]);
+    }
+  };
+
+  const handleSelectAllStudentsInFilter = (filteredList: UserProfile[]) => {
+    const ids = filteredList.map(s => s.uid);
+    const allSelected = ids.every(id => selectedStudentIds.includes(id));
+    if (allSelected) {
+      setSelectedStudentIds(selectedStudentIds.filter(id => !ids.includes(id)));
+    } else {
+      const newIds = Array.from(new Set([...selectedStudentIds, ...ids]));
+      setSelectedStudentIds(newIds);
+    }
+  };
+
+  const handleCreateHomework = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!title.trim() || !currentUser) return;
+
+    if (targetType === 'student' && selectedStudentIds.length === 0) {
+      setFormError('Lütfen ödevi atamak için en az bir öğrenci seçiniz.');
+      return;
+    }
+    setFormError(null);
+
+    let targetClassStr = 'Tüm Okul';
+    let targetClassesArray: string[] | undefined = undefined;
+
+    if (targetType === 'student') {
+      targetClassStr = `Özel (${selectedStudentIds.length} Öğrenci)`;
+    } else {
+      if (selectedClasses.includes('Tüm Okul') || selectedClasses.length === 0) {
+        targetClassStr = 'Tüm Okul';
+      } else {
+        targetClassStr = selectedClasses.join(', ');
+        targetClassesArray = selectedClasses;
+      }
+    }
+
+    if (editingHomework) {
+      await homeworkService.updateHomework(editingHomework.id, {
+        title: title.trim(),
+        subject: subject.trim(),
+        description: description.trim(),
+        targetType: targetType,
+        targetClass: targetClassStr,
+        targetClasses: targetClassesArray,
+        targetStudentIds: targetType === 'student' ? selectedStudentIds : undefined,
+        dueDate: dueDate,
+        dueTime: dueTime,
+        maxScore: Number(maxScore) || 100,
+        xpReward: Number(xpReward) || 50,
+        attachments: undefined,
+        rubric: enableRubric && rubricItems.length > 0 ? rubricItems : undefined,
+      });
+    } else {
+      const newHw: Homework = {
+        id: `hw-${Date.now()}`,
+        title: title.trim(),
+        subject: subject.trim(),
+        description: description.trim(),
+        teacherId: currentUser.uid,
+        teacherName: currentUser.displayName,
+        targetType: targetType,
+        targetClass: targetClassStr,
+        targetClasses: targetClassesArray,
+        targetStudentIds: targetType === 'student' ? selectedStudentIds : undefined,
+        dueDate: dueDate,
+        dueTime: dueTime,
+        maxScore: Number(maxScore) || 100,
+        xpReward: Number(xpReward) || 50,
+        attachments: undefined,
+        rubric: enableRubric && rubricItems.length > 0 ? rubricItems : undefined,
+        createdAt: new Date().toISOString()
+      };
+
+      await homeworkService.createHomework(newHw);
+    }
+
+    setShowCreateModal(false);
+    setEditingHomework(null);
+    setTitle('');
+    setDescription('');
+    setSelectedStudentIds([]);
+    setSelectedClasses(['Tüm Okul']);
+    
+    try {
+      confetti({ particleCount: 45, spread: 65 });
+    } catch (e) {}
+  };
+
+  const handleDelete = (id: string, title: string) => {
+    setDeleteConfirmHw({ id, title });
+  };
+
+  const confirmDeleteHw = async () => {
+    if (!deleteConfirmHw) return;
+    await homeworkService.deleteHomework(deleteConfirmHw.id);
+    setDeleteConfirmHw(null);
+  };
+
+  return (
+    <div className="space-y-6">
+      
+      {/* Top Header & Actions */}
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 bg-white dark:bg-slate-900 p-5 rounded-3xl border border-slate-200 dark:border-slate-800 shadow-xs">
+        <div>
+          <h2 className="text-lg font-bold text-slate-900 dark:text-white flex items-center gap-2">
+            <BookOpen className="w-5 h-5 text-indigo-500" />
+            Ödev Yönetimi & Takip Raporu
+          </h2>
+          <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+            Sınıflara ve öğrencilere yönergeleri detaylı ödevler atayın; rubrik kriterleri ile değerlendirin.
+          </p>
+        </div>
+
+        <div className="flex items-center gap-3">
+          {/* Class Filter */}
+          <select
+            value={selectedClassFilter}
+            onChange={(e) => setSelectedClassFilter(e.target.value)}
+            className="py-2 px-3 text-xs font-semibold rounded-xl border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-slate-800 dark:text-slate-200 focus:outline-none"
+          >
+            <option value="all">Tüm Sınıflar</option>
+            {classes.map(c => (
+              <option key={c.id} value={c.name}>{c.name}</option>
+            ))}
+          </select>
+
+          <button
+            id="add-new-homework-btn"
+            onClick={handleOpenCreateModal}
+            className="py-2.5 px-4 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold flex items-center gap-2 transition shadow-sm shadow-indigo-500/20"
+          >
+            <Plus className="w-4 h-4" />
+            Yeni Ödev Oluştur
+          </button>
+        </div>
+      </div>
+
+      {/* Homework Cards Grid */}
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
+        {filteredHomeworks.length === 0 ? (
+          <div className="col-span-full py-12 text-center bg-white dark:bg-slate-900 rounded-3xl border border-slate-200 dark:border-slate-800">
+            <BookOpen className="w-12 h-12 mx-auto text-slate-300 dark:text-slate-600 mb-2" />
+            <p className="text-sm font-semibold text-slate-700 dark:text-slate-300">Henüz ödev bulunmuyor</p>
+            <p className="text-xs text-slate-400 mt-1">"Yeni Ödev Oluştur" butonuna basarak ilk ödevinizi tanımlayın.</p>
+          </div>
+        ) : (
+          filteredHomeworks.map((hw) => {
+            const submissions = homeworkService.getSubmissionsForHomework(hw.id);
+            const total = submissions.length;
+            const completedCount = submissions.filter(s => s.status === 'completed').length;
+            const notCompletedCount = submissions.filter(s => s.status === 'not_completed').length;
+            const excusedCount = submissions.filter(s => s.status === 'excused').length;
+            const completionRate = total > 0 ? Math.round((completedCount / total) * 100) : 0;
+
+            const isPastDue = new Date(hw.dueDate).getTime() < new Date().setHours(0,0,0,0);
+
+            return (
+              <div 
+                key={hw.id}
+                className="bg-white dark:bg-slate-900 rounded-3xl border border-slate-200 dark:border-slate-800 p-5 shadow-xs flex flex-col justify-between hover:border-indigo-300 dark:hover:border-indigo-700 transition"
+              >
+                <div>
+                  <div className="flex items-start justify-between gap-2 mb-3">
+                    <span className="px-2.5 py-1 rounded-lg text-[11px] font-bold bg-indigo-50 dark:bg-indigo-950/60 text-indigo-700 dark:text-indigo-300 border border-indigo-200 dark:border-indigo-800">
+                      {hw.subject} • {hw.targetClass}
+                    </span>
+
+                    <div className="flex items-center gap-1">
+                      <button
+                        onClick={() => handleOpenEditModal(hw)}
+                        className="text-slate-400 hover:text-indigo-600 dark:hover:text-indigo-400 p-1 rounded-lg transition"
+                        title="Ödevi Düzenle"
+                      >
+                        <Edit3 className="w-4 h-4" />
+                      </button>
+                      <button
+                        onClick={() => handleDelete(hw.id, hw.title)}
+                        className="text-slate-400 hover:text-rose-500 p-1 rounded-lg transition"
+                        title="Ödevi Sil"
+                      >
+                        <Trash2 className="w-4 h-4" />
+                      </button>
+                    </div>
+                  </div>
+
+                  <h3 className="text-sm font-bold text-slate-900 dark:text-white leading-snug mb-1.5 line-clamp-2">
+                    {hw.title}
+                  </h3>
+
+                  <p className="text-xs text-slate-600 dark:text-slate-400 line-clamp-2 mb-3 leading-relaxed">
+                    {hw.description}
+                  </p>
+
+                  {/* Attachments & Rubric Badges */}
+                  <div className="flex flex-wrap items-center gap-2 mb-3">
+                    {hw.attachments && hw.attachments.length > 0 && (
+                      <span className="inline-flex items-center gap-1 text-[10px] font-bold px-2 py-0.5 rounded-md bg-blue-50 text-blue-700 dark:bg-blue-950 dark:text-blue-300 border border-blue-200/60 dark:border-blue-900">
+                        <Paperclip className="w-3 h-3" />
+                        {hw.attachments.length} Ek Dosya
+                      </span>
+                    )}
+                    {hw.rubric && hw.rubric.length > 0 && (
+                      <span className="inline-flex items-center gap-1 text-[10px] font-bold px-2 py-0.5 rounded-md bg-purple-50 text-purple-700 dark:bg-purple-950 dark:text-purple-300 border border-purple-200/60 dark:border-purple-900">
+                        <Sliders className="w-3 h-3" />
+                        {hw.rubric.length} Kriterli Rubrik
+                      </span>
+                    )}
+                    <span className="inline-flex items-center gap-1 text-[10px] font-black px-2 py-0.5 rounded-md bg-amber-50 text-amber-700 dark:bg-amber-950 dark:text-amber-300">
+                      +{hw.xpReward || 50} XP
+                    </span>
+                  </div>
+
+                  <div className="flex items-center justify-between text-xs text-slate-500 dark:text-slate-400 mb-4 pb-3 border-b border-slate-100 dark:border-slate-800">
+                    <span className="flex items-center gap-1">
+                      <Calendar className="w-3.5 h-3.5 text-slate-400" />
+                      Son Teslim: <strong className={isPastDue ? 'text-rose-500' : 'text-slate-700 dark:text-slate-300'}>{hw.dueDate} {hw.dueTime && `(${hw.dueTime})`}</strong>
+                    </span>
+                  </div>
+
+                  {/* Submission Progress bar */}
+                  <div className="mb-4">
+                    <div className="flex items-center justify-between text-xs mb-1.5">
+                      <span className="font-semibold text-slate-700 dark:text-slate-300 flex items-center gap-1.5">
+                        <Users className="w-3.5 h-3.5 text-indigo-500" />
+                        Teslim Durumu ({completedCount}/{total})
+                      </span>
+                      <span className="font-bold text-indigo-600 dark:text-indigo-400">%{completionRate}</span>
+                    </div>
+                    <div className="w-full h-2 bg-slate-100 dark:bg-slate-800 rounded-full overflow-hidden flex">
+                      <div style={{ width: `${completionRate}%` }} className="bg-emerald-500 transition-all duration-500"></div>
+                      <div style={{ width: `${total > 0 ? (notCompletedCount / total) * 100 : 0}%` }} className="bg-rose-500"></div>
+                      <div style={{ width: `${total > 0 ? (excusedCount / total) * 100 : 0}%` }} className="bg-amber-400"></div>
+                    </div>
+                    <div className="flex items-center justify-between text-[10px] text-slate-400 mt-1.5">
+                      <span className="text-emerald-600 dark:text-emerald-400 font-medium">✓ {completedCount} Yapıldı</span>
+                      <span className="text-rose-600 dark:text-rose-400 font-medium">✕ {notCompletedCount} Yapılmadı</span>
+                      <span className="text-amber-600 dark:text-amber-400 font-medium">📄 {excusedCount} Raporlu</span>
+                    </div>
+                  </div>
+                </div>
+
+                {/* 1-Click Ödev Takip Raporu Button */}
+                <button
+                  id={`track-hw-btn-${hw.id}`}
+                  onClick={() => setActiveTrackingHomework(hw)}
+                  className="w-full py-2.5 px-3 rounded-xl bg-indigo-50 hover:bg-indigo-600 hover:text-white dark:bg-slate-800 dark:hover:bg-indigo-600 text-indigo-700 dark:text-slate-200 text-xs font-bold flex items-center justify-center gap-2 border border-indigo-100 dark:border-slate-700 transition"
+                >
+                  <FileCheck className="w-4 h-4 text-indigo-500 group-hover:text-white" />
+                  Ödev Takip Raporunu Aç & Değerlendir
+                </button>
+              </div>
+            );
+          })
+        )}
+      </div>
+
+      {/* CREATE HOMEWORK MODAL */}
+      {showCreateModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm animate-in fade-in overflow-y-auto">
+          <div 
+            className="w-full max-w-2xl bg-white dark:bg-slate-900 rounded-3xl shadow-2xl border border-slate-200 dark:border-slate-800 overflow-hidden my-8"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between px-6 py-4 border-b border-slate-100 dark:border-slate-800">
+              <h3 className="text-base font-bold text-slate-900 dark:text-white flex items-center gap-2">
+                <BookOpen className="w-5 h-5 text-indigo-500" />
+                {editingHomework ? 'Ödevi Düzenle' : 'Kapsamlı Ödev & Rubrik Oluşturucu'}
+              </h3>
+              <button onClick={() => setShowCreateModal(false)} className="text-slate-400 hover:text-slate-600">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <form onSubmit={handleCreateHomework} className="p-6 space-y-4 max-h-[80vh] overflow-y-auto">
+              
+              {formError && (
+                <div className="p-3 bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-900 rounded-xl flex items-center gap-2 text-rose-700 dark:text-rose-300 text-xs font-semibold">
+                  <AlertCircle className="w-4 h-4 shrink-0" />
+                  <span>{formError}</span>
+                </div>
+              )}
+
+              <div>
+                <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-1">
+                  Ödev Başlığı <span className="text-rose-500">*</span>
+                </label>
+                <input
+                  type="text"
+                  placeholder="Örn: 2. Dereceden Denklemler & Parabol Çözüm Föyü"
+                  value={title}
+                  onChange={(e) => setTitle(e.target.value)}
+                  required
+                  className="w-full px-4 py-2.5 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white text-sm focus:ring-2 focus:ring-indigo-500 focus:outline-none"
+                />
+              </div>
+
+              {/* Ders Adı & Konu */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-1">
+                    Ders Adı <span className="text-rose-500">*</span>
+                  </label>
+                  <div className="relative">
+                    <input
+                      type="text"
+                      list="subjects-list"
+                      placeholder="Örn: Matematik, Fizik..."
+                      value={subject}
+                      onChange={(e) => setSubject(e.target.value)}
+                      required
+                      className="w-full px-3 py-2 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white text-sm focus:ring-2 focus:ring-indigo-500 focus:outline-none"
+                    />
+                    <datalist id="subjects-list">
+                      {STANDARD_SUBJECTS.map(subj => (
+                        <option key={subj} value={subj} />
+                      ))}
+                    </datalist>
+                  </div>
+                </div>
+
+                <div>
+                  <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-1">
+                    Başarı XP Ödülü
+                  </label>
+                  <input
+                    type="number"
+                    value={xpReward}
+                    onChange={(e) => setXpReward(Number(e.target.value))}
+                    min={10}
+                    max={200}
+                    className="w-full px-3 py-2 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white text-sm focus:ring-2 focus:ring-indigo-500 focus:outline-none"
+                  />
+                </div>
+              </div>
+
+              {/* HEDEF SEÇİMİ: SINIFLAR VEYA ÖĞRENCİLER */}
+              <div className="p-4 rounded-2xl bg-indigo-50/40 dark:bg-indigo-950/20 border border-indigo-100 dark:border-indigo-900/60 space-y-3">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                  <div>
+                    <label className="text-xs font-bold text-slate-900 dark:text-white flex items-center gap-1.5">
+                      <School className="w-4 h-4 text-indigo-600" />
+                      Ödev Kime Verilecek? <span className="text-rose-500">*</span>
+                    </label>
+                    <p className="text-[11px] text-slate-500">
+                      Ödevi tüm okula, belirli şubelere veya doğrudan seçtiğiniz öğrencilere atayabilirsiniz.
+                    </p>
+                  </div>
+
+                  {/* Target Type Switcher */}
+                  <div className="flex items-center p-1 bg-slate-200/80 dark:bg-slate-800 rounded-xl">
+                    <button
+                      type="button"
+                      onClick={() => setTargetType('class')}
+                      className={`px-3 py-1 text-xs font-bold rounded-lg transition ${
+                        targetType === 'class'
+                          ? 'bg-white dark:bg-slate-700 text-indigo-600 dark:text-white shadow-xs'
+                          : 'text-slate-600 dark:text-slate-400 hover:text-slate-900'
+                      }`}
+                    >
+                      Sınıf / Şube Seç
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setTargetType('student')}
+                      className={`px-3 py-1 text-xs font-bold rounded-lg transition ${
+                        targetType === 'student'
+                          ? 'bg-white dark:bg-slate-700 text-indigo-600 dark:text-white shadow-xs'
+                          : 'text-slate-600 dark:text-slate-400 hover:text-slate-900'
+                      }`}
+                    >
+                      Öğrenci Seç ({selectedStudentIds.length})
+                    </button>
+                  </div>
+                </div>
+
+                {/* MODE A: CLASS SELECTION */}
+                {targetType === 'class' && (
+                  <div className="space-y-2 pt-1">
+                    <div className="flex flex-wrap gap-2">
+                      <button
+                        type="button"
+                        onClick={() => handleToggleClass('Tüm Okul')}
+                        className={`px-3 py-1.5 rounded-xl text-xs font-bold transition border ${
+                          selectedClasses.includes('Tüm Okul')
+                            ? 'bg-indigo-600 text-white border-indigo-600 shadow-xs'
+                            : 'bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-300 border-slate-200 dark:border-slate-700 hover:bg-slate-50'
+                        }`}
+                      >
+                        Tüm Okul
+                      </button>
+                      {classes.map(c => {
+                        const isSelected = selectedClasses.includes(c.name);
+                        return (
+                          <button
+                            key={c.id}
+                            type="button"
+                            onClick={() => handleToggleClass(c.name)}
+                            className={`px-3 py-1.5 rounded-xl text-xs font-bold transition border ${
+                              isSelected
+                                ? 'bg-indigo-600 text-white border-indigo-600 shadow-xs'
+                                : 'bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-300 border-slate-200 dark:border-slate-700 hover:bg-slate-50'
+                            }`}
+                          >
+                            {c.name}
+                          </button>
+                        );
+                      })}
+                    </div>
+                    <div className="text-[11px] text-indigo-600 dark:text-indigo-400 font-medium">
+                      Seçilen Hedef: {selectedClasses.join(', ')}
+                    </div>
+                  </div>
+                )}
+
+                {/* MODE B: STUDENT SPECIFIC SELECTION */}
+                {targetType === 'student' && (
+                  <div className="space-y-3 pt-1">
+                    {/* Filters for students */}
+                    <div className="flex flex-col sm:flex-row gap-2">
+                      <input
+                        type="text"
+                        placeholder="Öğrenci adı, soyadı veya okul no ile ara..."
+                        value={studentSearchQuery}
+                        onChange={(e) => setStudentSearchQuery(e.target.value)}
+                        className="flex-1 px-3 py-1.5 text-xs rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white"
+                      />
+                      <select
+                        value={studentClassFilter}
+                        onChange={(e) => setStudentClassFilter(e.target.value)}
+                        className="px-3 py-1.5 text-xs rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white"
+                      >
+                        <option value="all">Tüm Şubeler</option>
+                        {classes.map(c => (
+                          <option key={c.id} value={c.name}>{c.name}</option>
+                        ))}
+                      </select>
+                    </div>
+
+                    {/* Student List with Checkboxes */}
+                    {(() => {
+                      const filteredStudentsList = allStudents.filter(st => {
+                        const q = studentSearchQuery.toLowerCase();
+                        const matchQ = !q || st.displayName.toLowerCase().includes(q) || (st.schoolNumber && st.schoolNumber.includes(q));
+                        const matchC = studentClassFilter === 'all' || st.classGrade === studentClassFilter;
+                        return matchQ && matchC;
+                      });
+
+                      return (
+                        <div className="space-y-1.5">
+                          <div className="flex items-center justify-between text-[11px] text-slate-500 px-1">
+                            <span>Gösterilen: {filteredStudentsList.length} öğrenci (Seçilen: {selectedStudentIds.length})</span>
+                            <button
+                              type="button"
+                              onClick={() => handleSelectAllStudentsInFilter(filteredStudentsList)}
+                              className="font-bold text-indigo-600 dark:text-indigo-400 hover:underline"
+                            >
+                              Bu listedekilerin tümünü {filteredStudentsList.every(s => selectedStudentIds.includes(s.uid)) ? 'bırak' : 'seç'}
+                            </button>
+                          </div>
+
+                          <div className="max-h-40 overflow-y-auto rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 p-2 divide-y divide-slate-100 dark:divide-slate-700/60">
+                            {filteredStudentsList.length === 0 ? (
+                              <div className="p-3 text-center text-xs text-slate-400">
+                                Kriterlere uygun öğrenci bulunamadı.
+                              </div>
+                            ) : (
+                              filteredStudentsList.map(st => {
+                                const isChecked = selectedStudentIds.includes(st.uid);
+                                return (
+                                  <label
+                                    key={st.uid}
+                                    className="flex items-center justify-between p-2 rounded-lg hover:bg-slate-50 dark:hover:bg-slate-700/40 cursor-pointer transition"
+                                  >
+                                    <div className="flex items-center gap-2.5">
+                                      <input
+                                        type="checkbox"
+                                        checked={isChecked}
+                                        onChange={() => handleToggleStudent(st.uid)}
+                                        className="rounded text-indigo-600 focus:ring-indigo-500 w-4 h-4 cursor-pointer"
+                                      />
+                                      <div>
+                                        <div className="text-xs font-bold text-slate-800 dark:text-slate-200 flex items-center gap-1.5">
+                                          {st.displayName}
+                                          {st.schoolNumber && (
+                                            <span className="text-[10px] text-slate-400 font-mono">#{st.schoolNumber}</span>
+                                          )}
+                                        </div>
+                                        <div className="text-[10px] text-slate-400">{st.classGrade || 'Sınıf belirtilmemiş'}</div>
+                                      </div>
+                                    </div>
+                                    {isChecked && (
+                                      <span className="text-[10px] font-bold text-emerald-600 dark:text-emerald-400 bg-emerald-50 dark:bg-emerald-950 px-2 py-0.5 rounded-full">
+                                        Seçildi
+                                      </span>
+                                    )}
+                                  </label>
+                                );
+                              })
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })()}
+                  </div>
+                )}
+              </div>
+
+              {/* TESLİM TARİHİ VE SAATİ */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-1">
+                    Son Teslim Tarihi <span className="text-rose-500">*</span>
+                  </label>
+                  <input
+                    type="date"
+                    value={dueDate}
+                    onChange={(e) => setDueDate(e.target.value)}
+                    required
+                    className="w-full px-3 py-2 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white text-sm focus:ring-2 focus:ring-indigo-500 focus:outline-none"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-1">
+                    Saat Sınırı
+                  </label>
+                  <input
+                    type="time"
+                    value={dueTime}
+                    onChange={(e) => setDueTime(e.target.value)}
+                    className="w-full px-3 py-2 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white text-sm focus:ring-2 focus:ring-indigo-500 focus:outline-none"
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-1">
+                  Ödev Açıklaması ve Yönergeler <span className="text-rose-500">*</span>
+                </label>
+                <textarea
+                  rows={3}
+                  placeholder="Ödev soruları, kitap sayfaları, dikkat edilecek hususlar veya inceleme detayları..."
+                  value={description}
+                  onChange={(e) => setDescription(e.target.value)}
+                  required
+                  className="w-full px-4 py-2.5 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white text-sm focus:ring-2 focus:ring-indigo-500 focus:outline-none"
+                />
+              </div>
+
+              {/* GRADING RUBRIC SECTION */}
+              <div className="p-4 rounded-2xl bg-indigo-50/50 dark:bg-indigo-950/20 border border-indigo-100 dark:border-indigo-900/60 space-y-3">
+                <div className="flex items-center justify-between">
+                  <label className="text-xs font-bold text-indigo-900 dark:text-indigo-200 flex items-center gap-1.5">
+                    <Sliders className="w-3.5 h-3.5 text-indigo-600" />
+                    Değerlendirme Rubrik Kriterleri (Opsiyonel)
+                  </label>
+                  <label className="flex items-center gap-1.5 text-xs text-indigo-700 dark:text-indigo-300 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={enableRubric}
+                      onChange={(e) => setEnableRubric(e.target.checked)}
+                      className="rounded text-indigo-600 focus:ring-indigo-500"
+                    />
+                    Rubrik Kullan
+                  </label>
+                </div>
+
+                {enableRubric && (
+                  <div className="space-y-2">
+                    {rubricItems.map((item, idx) => (
+                      <div key={item.id} className="p-2.5 rounded-xl bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 flex items-center justify-between gap-2 text-xs">
+                        <div className="flex-1">
+                          <p className="font-bold text-slate-800 dark:text-slate-200">{item.title}</p>
+                          <p className="text-[10px] text-slate-400">{item.description}</p>
+                        </div>
+                        <span className="font-black text-indigo-600 dark:text-indigo-400 px-2 py-1 bg-indigo-50 dark:bg-indigo-950 rounded-lg shrink-0">
+                          {item.maxPoints} Puan
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              <div className="flex items-center justify-end gap-3 pt-3 border-t border-slate-100 dark:border-slate-800">
+                <button
+                  type="button"
+                  onClick={() => setShowCreateModal(false)}
+                  className="px-4 py-2 text-xs font-bold text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-xl transition"
+                >
+                  Vazgeç
+                </button>
+                <button
+                  type="submit"
+                  className="px-5 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold shadow-md shadow-indigo-500/20 transition"
+                >
+                  {editingHomework ? 'Değişiklikleri Kaydet' : 'Ödevi Yayınla & Bildirim Gönder'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* HOMEWORK TRACKING REPORT MODAL (ÖDEV TAKİP RAPORU & RUBRİK DEĞERLENDİRME) */}
+      {activeTrackingHomework && (
+        <HomeworkTrackingReportModal 
+          homework={activeTrackingHomework} 
+          onClose={() => setActiveTrackingHomework(null)} 
+        />
+      )}
+
+      {/* Delete Confirmation Modal */}
+      {deleteConfirmHw && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-xs animate-in fade-in">
+          <div className="bg-white dark:bg-slate-900 rounded-3xl p-6 max-w-sm w-full border border-slate-200 dark:border-slate-800 shadow-2xl space-y-4">
+            <div className="flex items-center gap-3">
+              <div className="p-3 rounded-2xl bg-rose-100 dark:bg-rose-950/60 text-rose-600">
+                <Trash2 className="w-5 h-5" />
+              </div>
+              <div>
+                <h4 className="text-sm font-bold text-slate-900 dark:text-white">Ödevi Sil</h4>
+                <p className="text-xs text-slate-500">Bu işlem geri alınamaz.</p>
+              </div>
+            </div>
+            <p className="text-xs text-slate-600 dark:text-slate-300">
+              <strong>"{deleteConfirmHw.title}"</strong> başlıklı ödevi ve tüm öğrenci teslim kayıtlarını silmek istediğinize emin misiniz?
+            </p>
+            <div className="flex items-center justify-end gap-2 pt-2">
+              <button
+                type="button"
+                onClick={() => setDeleteConfirmHw(null)}
+                className="px-4 py-2 rounded-xl text-xs font-semibold text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800 transition"
+              >
+                Vazgeç
+              </button>
+              <button
+                type="button"
+                onClick={confirmDeleteHw}
+                className="px-4 py-2 rounded-xl text-xs font-bold bg-rose-600 hover:bg-rose-700 text-white transition shadow-xs"
+              >
+                Evet, Sil
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+    </div>
+  );
+};
+
+// SUB-COMPONENT: ÖDEV TAKİP RAPORU & 1-CLICK STATUS & RUBRIC EVALUATION
+const HomeworkTrackingReportModal: React.FC<{
+  homework: Homework;
+  onClose: () => void;
+}> = ({ homework, onClose }) => {
+  const { currentUser } = useAuth();
+  const [submissions, setSubmissions] = useState<HomeworkSubmission[]>(() => 
+    homeworkService.getSubmissionsForHomework(homework.id)
+  );
+  const [searchFilter, setSearchFilter] = useState('');
+  const [statusFilter, setStatusFilter] = useState<string>('all');
+  
+  // Detailed Rubric Scoring Modal for an individual student
+  const [evaluatingStudent, setEvaluatingStudent] = useState<HomeworkSubmission | null>(null);
+  const [rubricScores, setRubricScores] = useState<Record<string, number>>({});
+  const [teacherFeedbackText, setTeacherFeedbackText] = useState('');
+
+  // Inspect student submitted files (Video, Image, Note, Documents)
+  const [inspectingSubmission, setInspectingSubmission] = useState<HomeworkSubmission | null>(null);
+  const [activeMediaPreview, setActiveMediaPreview] = useState<Attachment | null>(null);
+
+  const reloadSubmissions = () => {
+    setSubmissions([...homeworkService.getSubmissionsForHomework(homework.id)]);
+  };
+
+  useEffect(() => {
+    reloadSubmissions();
+    const unsub = homeworkService.subscribe(reloadSubmissions);
+    return unsub;
+  }, [homework.id]);
+
+  const handleUpdateStatus = async (
+    studentId: string, 
+    newStatus: HomeworkStatus, 
+    score?: number
+  ) => {
+    await homeworkService.updateStudentSubmissionStatus(
+      homework.id, 
+      studentId, 
+      newStatus, 
+      score, 
+      undefined, 
+      undefined, 
+      currentUser?.displayName || 'Öğretmen'
+    );
+    reloadSubmissions();
+  };
+
+  const handleSetAllCompleted = async () => {
+    for (const sub of submissions) {
+      await homeworkService.updateStudentSubmissionStatus(
+        homework.id, 
+        sub.studentId, 
+        'completed', 
+        100, 
+        'Harika çalışma!', 
+        undefined, 
+        currentUser?.displayName || 'Öğretmen'
+      );
+    }
+    reloadSubmissions();
+    try {
+      confetti({ particleCount: 50, spread: 70 });
+    } catch (e) {}
+  };
+
+  const handleOpenRubricEvaluation = (sub: HomeworkSubmission) => {
+    setEvaluatingStudent(sub);
+    setTeacherFeedbackText(sub.teacherFeedback || '');
+    
+    // Initial rubric scores
+    const initial: Record<string, number> = {};
+    if (homework.rubric) {
+      homework.rubric.forEach(r => {
+        initial[r.id] = sub.rubricScores?.[r.id] !== undefined ? sub.rubricScores[r.id] : r.maxPoints;
+      });
+    }
+    setRubricScores(initial);
+  };
+
+  const handleSaveRubricEvaluation = async () => {
+    if (!evaluatingStudent) return;
+    
+    // Calculate total score from rubrics
+    let calculatedTotal = 0;
+    Object.values(rubricScores).forEach(pts => {
+      calculatedTotal += Number(pts) || 0;
+    });
+
+    await homeworkService.updateStudentSubmissionStatus(
+      homework.id,
+      evaluatingStudent.studentId,
+      'completed',
+      calculatedTotal,
+      teacherFeedbackText.trim() || undefined,
+      rubricScores,
+      currentUser?.displayName || 'Öğretmen'
+    );
+
+    setEvaluatingStudent(null);
+    reloadSubmissions();
+  };
+
+  const filtered = submissions.filter(s => {
+    const q = (searchFilter || '').toLowerCase();
+    const matchSearch = (s.studentName || '').toLowerCase().includes(q) || 
+                        (s.studentNumber || '').includes(searchFilter);
+    const matchStatus = statusFilter === 'all' || s.status === statusFilter;
+    return matchSearch && matchStatus;
+  });
+
+  const completedCount = submissions.filter(s => s.status === 'completed').length;
+  const notCompletedCount = submissions.filter(s => s.status === 'not_completed').length;
+  const excusedCount = submissions.filter(s => s.status === 'excused').length;
+  const pendingCount = submissions.filter(s => s.status === 'pending').length;
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-6 bg-slate-900/70 backdrop-blur-sm animate-in fade-in">
+      <div 
+        className="w-full max-w-4xl max-h-[90vh] bg-white dark:bg-slate-900 rounded-3xl shadow-2xl border border-slate-200 dark:border-slate-800 flex flex-col overflow-hidden"
+        onClick={(e) => e.stopPropagation()}
+      >
+        {/* Modal Header */}
+        <div className="p-5 border-b border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-800/40 flex items-center justify-between">
+          <div>
+            <div className="flex items-center gap-2">
+              <span className="px-2.5 py-0.5 text-xs font-bold rounded-lg bg-indigo-100 text-indigo-800 dark:bg-indigo-900 dark:text-indigo-200">
+                {homework.targetClass}
+              </span>
+              <h3 className="text-base font-bold text-slate-900 dark:text-white">
+                {homework.title}
+              </h3>
+            </div>
+            <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
+              {homework.subject} • Son Teslim: {homework.dueDate} {homework.dueTime && `(${homework.dueTime})`} • Tek tıkla ödev durumlarını güncelleyin.
+            </p>
+          </div>
+          <button
+            onClick={onClose}
+            className="p-2 rounded-xl text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 hover:bg-slate-200 dark:hover:bg-slate-800 transition"
+          >
+            <X className="w-5 h-5" />
+          </button>
+        </div>
+
+        {/* Quick Stats & Filters Bar */}
+        <div className="p-4 bg-white dark:bg-slate-900 border-b border-slate-200 dark:border-slate-800 flex flex-wrap items-center justify-between gap-3">
+          
+          {/* Quick Status Badges */}
+          <div className="flex items-center gap-2 text-xs flex-wrap">
+            <span className="px-3 py-1 rounded-lg bg-slate-100 dark:bg-slate-800 font-bold text-slate-700 dark:text-slate-300">
+              Toplam: {submissions.length} Öğrenci
+            </span>
+            <span className="px-2.5 py-1 rounded-lg bg-emerald-100 dark:bg-emerald-950/60 font-semibold text-emerald-700 dark:text-emerald-300">
+              ✓ {completedCount} Yapıldı
+            </span>
+            <span className="px-2.5 py-1 rounded-lg bg-rose-100 dark:bg-rose-950/60 font-semibold text-rose-700 dark:text-rose-300">
+              ✕ {notCompletedCount} Yapılmadı
+            </span>
+            <span className="px-2.5 py-1 rounded-lg bg-amber-100 dark:bg-amber-950/60 font-semibold text-amber-700 dark:text-amber-300">
+              📄 {excusedCount} Raporlu
+            </span>
+            <span className="px-2.5 py-1 rounded-lg bg-slate-200 dark:bg-slate-800 font-semibold text-slate-600 dark:text-slate-400">
+              ⏳ {pendingCount} Bekliyor
+            </span>
+          </div>
+
+          {/* Bulk Action & Search */}
+          <div className="flex items-center gap-2 w-full sm:w-auto">
+            <div className="relative flex-1 sm:w-48">
+              <Search className="w-3.5 h-3.5 absolute left-3 top-2.5 text-slate-400" />
+              <input
+                type="text"
+                placeholder="Öğrenci veya No ara..."
+                value={searchFilter}
+                onChange={(e) => setSearchFilter(e.target.value)}
+                className="w-full pl-8 pr-3 py-1.5 text-xs rounded-xl border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-slate-900 dark:text-white focus:outline-none"
+              />
+            </div>
+
+            <button
+              onClick={handleSetAllCompleted}
+              className="px-3 py-1.5 text-xs font-bold rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white transition shrink-0 flex items-center gap-1 shadow-xs"
+              title="Tüm sınıfı 'Yapıldı (100 Puan)' olarak işaretler"
+            >
+              <Check className="w-3.5 h-3.5" />
+              Tümünü Yapıldı Say
+            </button>
+          </div>
+
+        </div>
+
+        {/* Student Roster Table with 1-Click Toggle Buttons */}
+        <div className="flex-1 overflow-y-auto p-4">
+          <div className="overflow-x-auto rounded-2xl border border-slate-200 dark:border-slate-800">
+            <table className="w-full text-left text-xs">
+              <thead className="bg-slate-50 dark:bg-slate-800/60 text-slate-600 dark:text-slate-400 font-bold border-b border-slate-200 dark:border-slate-800">
+                <tr>
+                  <th className="py-3 px-4 w-20">Okul No</th>
+                  <th className="py-3 px-4">Öğrenci Adı Soyadı</th>
+                  <th className="py-3 px-4">Öğrenci Yanıtı & Dosyalar</th>
+                  <th className="py-3 px-4">Mevcut Durum</th>
+                  <th className="py-3 px-4 text-center">Tek Tıkla Durum Güncelle</th>
+                  <th className="py-3 px-4 text-center">Detaylı Değerlendirme</th>
+                  <th className="py-3 px-4 w-20 text-right">Puan</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100 dark:divide-slate-800/60">
+                {filtered.map((sub) => (
+                  <tr key={sub.studentId} className="hover:bg-slate-50/80 dark:hover:bg-slate-800/40 transition">
+                    <td className="py-3 px-4 font-bold text-slate-700 dark:text-slate-300">
+                      #{sub.studentNumber}
+                    </td>
+                    <td className="py-3 px-4 font-semibold text-slate-900 dark:text-white">
+                      {sub.studentName}
+                      {sub.teacherFeedback && (
+                        <p className="text-[10px] text-indigo-600 dark:text-indigo-400 flex items-center gap-1 mt-0.5 font-normal">
+                          <MessageSquare className="w-3 h-3 text-indigo-400" />
+                          Geri Bildirim: {sub.teacherFeedback}
+                        </p>
+                      )}
+                    </td>
+
+                    {/* Student Submitted Files / Video / Photo / Note Column */}
+                    <td className="py-3 px-4">
+                      {sub.attachments && sub.attachments.length > 0 ? (
+                        <button
+                          onClick={() => setInspectingSubmission(sub)}
+                          className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-xl bg-purple-50 hover:bg-purple-100 dark:bg-purple-950/60 dark:hover:bg-purple-900/60 text-purple-700 dark:text-purple-300 border border-purple-200 dark:border-purple-800 text-[11px] font-bold transition shadow-xs cursor-pointer"
+                        >
+                          {sub.attachments.some(a => a.type === 'video' || /\.(mp4|webm|mov|avi)$/i.test(a.name)) ? (
+                            <Video className="w-3.5 h-3.5 text-purple-600" />
+                          ) : sub.attachments.some(a => a.type === 'image' || /\.(png|jpg|jpeg|webp)$/i.test(a.name)) ? (
+                            <ImageIcon className="w-3.5 h-3.5 text-sky-600" />
+                          ) : (
+                            <Paperclip className="w-3.5 h-3.5 text-emerald-600" />
+                          )}
+                          <span>{sub.attachments.length} Dosya (İncele)</span>
+                        </button>
+                      ) : sub.submissionNote ? (
+                        <button
+                          onClick={() => setInspectingSubmission(sub)}
+                          className="inline-flex items-center gap-1 text-[11px] text-slate-600 dark:text-slate-300 hover:text-indigo-600 truncate max-w-[140px] cursor-pointer"
+                        >
+                          <MessageSquare className="w-3 h-3 text-slate-400 shrink-0" />
+                          <span className="truncate">{sub.submissionNote}</span>
+                        </button>
+                      ) : (
+                        <span className="text-[11px] text-slate-400 italic">Dosya yok</span>
+                      )}
+                    </td>
+
+                    <td className="py-3 px-4">
+                      {sub.status === 'completed' && (
+                        <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[11px] font-bold bg-emerald-100 text-emerald-800 dark:bg-emerald-950/80 dark:text-emerald-300">
+                          <CheckCircle2 className="w-3 h-3 text-emerald-600" /> Yapıldı
+                        </span>
+                      )}
+                      {sub.status === 'not_completed' && (
+                        <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[11px] font-bold bg-rose-100 text-rose-800 dark:bg-rose-950/80 dark:text-rose-300">
+                          <XCircle className="w-3 h-3 text-rose-600" /> Yapılmadı
+                        </span>
+                      )}
+                      {sub.status === 'excused' && (
+                        <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[11px] font-bold bg-amber-100 text-amber-800 dark:bg-amber-950/80 dark:text-amber-300">
+                          <AlertCircle className="w-3 h-3 text-amber-600" /> Raporlu / İzinli
+                        </span>
+                      )}
+                      {sub.status === 'pending' && (
+                        <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[11px] font-medium bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-400">
+                          <Clock className="w-3 h-3" /> Bekliyor
+                        </span>
+                      )}
+                    </td>
+
+                    {/* 1-Click Action Buttons */}
+                    <td className="py-3 px-4">
+                      <div className="flex items-center justify-center gap-1.5">
+                        <button
+                          onClick={() => handleUpdateStatus(sub.studentId, 'completed', sub.score || 100)}
+                          className={`px-2.5 py-1 rounded-lg text-[11px] font-bold transition flex items-center gap-1 ${
+                            sub.status === 'completed'
+                              ? 'bg-emerald-600 text-white shadow-xs'
+                              : 'bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 hover:bg-emerald-50 hover:text-emerald-700 dark:hover:bg-emerald-950/50'
+                          }`}
+                        >
+                          <Check className="w-3 h-3" />
+                          Yapıldı
+                        </button>
+
+                        <button
+                          onClick={() => handleUpdateStatus(sub.studentId, 'not_completed', 0)}
+                          className={`px-2.5 py-1 rounded-lg text-[11px] font-bold transition flex items-center gap-1 ${
+                            sub.status === 'not_completed'
+                              ? 'bg-rose-600 text-white shadow-xs'
+                              : 'bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 hover:bg-rose-50 hover:text-rose-700 dark:hover:bg-rose-950/50'
+                          }`}
+                        >
+                          <X className="w-3 h-3" />
+                          Yapılmadı
+                        </button>
+
+                        <button
+                          onClick={() => handleUpdateStatus(sub.studentId, 'excused')}
+                          className={`px-2.5 py-1 rounded-lg text-[11px] font-bold transition flex items-center gap-1 ${
+                            sub.status === 'excused'
+                              ? 'bg-amber-500 text-white shadow-xs'
+                              : 'bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 hover:bg-amber-50 hover:text-amber-700 dark:hover:bg-amber-950/50'
+                          }`}
+                        >
+                          Raporlu
+                        </button>
+                      </div>
+                    </td>
+
+                    {/* Rubric Evaluator Modal trigger */}
+                    <td className="py-3 px-4 text-center">
+                      <button
+                        onClick={() => handleOpenRubricEvaluation(sub)}
+                        className="px-2.5 py-1 rounded-lg text-[11px] font-bold bg-indigo-50 hover:bg-indigo-100 dark:bg-indigo-950/60 dark:hover:bg-indigo-900/60 text-indigo-700 dark:text-indigo-300 border border-indigo-200 dark:border-indigo-800 transition flex items-center gap-1 mx-auto cursor-pointer"
+                      >
+                        <Sliders className="w-3 h-3" />
+                        Rubrik Notla
+                      </button>
+                    </td>
+
+                    {/* Score display */}
+                    <td className="py-3 px-4 text-right">
+                      <span className="font-extrabold text-sm text-slate-900 dark:text-white">
+                        {sub.score !== undefined ? `${sub.score} / ${homework.maxScore}` : '-'}
+                      </span>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        {/* Footer */}
+        <div className="p-4 border-t border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/40 flex items-center justify-between">
+          <p className="text-xs text-slate-500 dark:text-slate-400">
+            Ödev durumu güncellendiğinde öğrenci paneline anlık canlı bildirim gönderilir ve XP işlenir.
+          </p>
+          <button
+            onClick={onClose}
+            className="px-5 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 dark:bg-slate-100 dark:hover:bg-white text-white dark:text-slate-900 text-xs font-bold transition cursor-pointer"
+          >
+            Raporu Kapat
+          </button>
+        </div>
+
+      </div>
+
+      {/* DEDICATED STUDENT SUBMISSION DETAIL MODAL (VIDEOS, IMAGES, DOCS) */}
+      {inspectingSubmission && (
+        <div 
+          className="fixed inset-0 z-60 flex items-center justify-center p-4 bg-slate-900/75 backdrop-blur-sm animate-in fade-in"
+          onClick={() => setInspectingSubmission(null)}
+        >
+          <div 
+            className="w-full max-w-2xl bg-white dark:bg-slate-900 rounded-3xl shadow-2xl border border-slate-200 dark:border-slate-800 overflow-hidden flex flex-col max-h-[90vh]"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {/* Modal Header */}
+            <div className="flex items-center justify-between px-6 py-4 border-b border-slate-100 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-800/50">
+              <div className="flex items-center gap-2">
+                <FileCheck className="w-5 h-5 text-purple-600" />
+                <div>
+                  <h4 className="font-bold text-base text-slate-900 dark:text-white">
+                    Öğrenci Yanıtı & Teslim Dosyaları
+                  </h4>
+                  <p className="text-xs text-slate-500">
+                    {inspectingSubmission.studentName} (#{inspectingSubmission.studentNumber}) • {homework.title}
+                  </p>
+                </div>
+              </div>
+              <button 
+                onClick={() => setInspectingSubmission(null)}
+                className="text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 p-1 rounded-xl"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* Modal Body */}
+            <div className="p-6 overflow-y-auto space-y-5">
+              {/* Submission Status & Date */}
+              <div className="flex flex-wrap items-center justify-between gap-2 p-3 rounded-2xl bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-xs">
+                <div>
+                  <span className="text-slate-400">Teslim Tarihi: </span>
+                  <strong className="text-slate-700 dark:text-slate-300">
+                    {inspectingSubmission.submittedAt ? new Date(inspectingSubmission.submittedAt).toLocaleString('tr-TR') : 'Belirtilmedi'}
+                  </strong>
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="text-slate-400">Durum: </span>
+                  <span className={`px-2.5 py-0.5 rounded-full font-bold text-[11px] ${
+                    inspectingSubmission.status === 'completed'
+                      ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300'
+                      : inspectingSubmission.status === 'not_completed'
+                      ? 'bg-rose-100 text-rose-800 dark:bg-rose-950 dark:text-rose-300'
+                      : 'bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-300'
+                  }`}>
+                    {inspectingSubmission.status === 'completed' ? 'Yapıldı' : inspectingSubmission.status === 'not_completed' ? 'Yapılmadı' : 'Raporlu / Bekliyor'}
+                  </span>
+                </div>
+              </div>
+
+              {/* Student Note */}
+              <div>
+                <h5 className="text-xs font-bold text-slate-700 dark:text-slate-300 mb-1.5 flex items-center gap-1.5">
+                  <MessageSquare className="w-4 h-4 text-indigo-500" />
+                  Öğrencinin Açıklama Notu
+                </h5>
+                <div className="p-3.5 rounded-2xl bg-indigo-50/40 dark:bg-indigo-950/20 border border-indigo-100 dark:border-indigo-900/40 text-xs text-slate-800 dark:text-slate-200 leading-relaxed">
+                  {inspectingSubmission.submissionNote || 'Öğrenci yazılı bir not bırakmamış.'}
+                </div>
+              </div>
+
+              {/* Attachments / Video & Photo Players */}
+              <div>
+                <h5 className="text-xs font-bold text-slate-700 dark:text-slate-300 mb-2 flex items-center gap-1.5">
+                  <Paperclip className="w-4 h-4 text-purple-500" />
+                  Veritabanında Kayıtlı Teslim Dosyaları ({inspectingSubmission.attachments?.length || 0})
+                </h5>
+
+                {inspectingSubmission.attachments && inspectingSubmission.attachments.length > 0 ? (
+                  <div className="space-y-4">
+                    {inspectingSubmission.attachments.map((att, idx) => {
+                      const isVid = att.type === 'video' || /\.(mp4|webm|mov|avi|mkv)$/i.test(att.name);
+                      const isImg = att.type === 'image' || /\.(png|jpg|jpeg|webp|gif)$/i.test(att.name);
+
+                      return (
+                        <div 
+                          key={att.id || idx}
+                          className="p-4 rounded-2xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 space-y-3 shadow-xs"
+                        >
+                          <div className="flex items-center justify-between gap-2">
+                            <div className="flex items-center gap-2 truncate">
+                              {isVid ? (
+                                <Video className="w-4 h-4 text-purple-600 shrink-0" />
+                              ) : isImg ? (
+                                <ImageIcon className="w-4 h-4 text-sky-600 shrink-0" />
+                              ) : (
+                                <FileText className="w-4 h-4 text-emerald-600 shrink-0" />
+                              )}
+                              <span className="font-bold text-xs text-slate-800 dark:text-slate-200 truncate">
+                                {att.name}
+                              </span>
+                              <span className="text-[10px] text-slate-400">({att.size || 'Belirtilmedi'})</span>
+                            </div>
+
+                            {att.url && att.url !== '#' && (
+                              <a
+                                href={att.url}
+                                download={att.name}
+                                className="px-2.5 py-1 rounded-lg bg-slate-100 hover:bg-slate-200 dark:bg-slate-700 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-200 text-xs font-semibold flex items-center gap-1 transition"
+                              >
+                                <Download className="w-3 h-3" /> İndir
+                              </a>
+                            )}
+                          </div>
+
+                          {/* Inline Video Player */}
+                          {isVid && att.url && att.url !== '#' && (
+                            <div className="rounded-xl overflow-hidden bg-black border border-slate-700">
+                              <video 
+                                src={att.url} 
+                                controls 
+                                playsInline
+                                className="w-full max-h-72 object-contain"
+                              >
+                                Tarayıcınız video oynatmayı desteklemiyor.
+                              </video>
+                            </div>
+                          )}
+
+                          {/* Inline Image Viewer */}
+                          {isImg && att.url && att.url !== '#' && (
+                            <div className="rounded-xl overflow-hidden bg-slate-100 dark:bg-slate-900 flex justify-center p-2 border border-slate-200 dark:border-slate-700">
+                              <img 
+                                src={att.url} 
+                                alt={att.name} 
+                                className="max-h-72 object-contain rounded-lg cursor-pointer hover:opacity-95 transition"
+                                onClick={() => setActiveMediaPreview(att)}
+                              />
+                            </div>
+                          )}
+
+                          {/* Document view link */}
+                          {!isVid && !isImg && att.url && att.url !== '#' && (
+                            <a
+                              href={att.url}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="inline-flex items-center gap-1.5 text-xs text-indigo-600 dark:text-indigo-400 hover:underline font-bold"
+                            >
+                              <FileText className="w-3.5 h-3.5" />
+                              Dosyayı Yeni Sekmede Görüntüle
+                            </a>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                ) : (
+                  <div className="p-4 rounded-2xl bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-center text-xs text-slate-400">
+                    Öğrenci herhangi bir video, görsel veya dosya yüklememiş.
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* Modal Footer with quick grading actions */}
+            <div className="p-4 border-t border-slate-100 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/50 flex flex-wrap items-center justify-between gap-2">
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => {
+                    handleUpdateStatus(inspectingSubmission.studentId, 'completed', 100);
+                    setInspectingSubmission(null);
+                  }}
+                  className="px-3 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold flex items-center gap-1 transition shadow-xs cursor-pointer"
+                >
+                  <Check className="w-3.5 h-3.5" />
+                  Ödevi Onayla (100 Puan)
+                </button>
+                <button
+                  onClick={() => {
+                    handleOpenRubricEvaluation(inspectingSubmission);
+                    setInspectingSubmission(null);
+                  }}
+                  className="px-3 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold flex items-center gap-1 transition shadow-xs cursor-pointer"
+                >
+                  <Sliders className="w-3.5 h-3.5" />
+                  Rubrik ile Notlandır
+                </button>
+              </div>
+
+              <button
+                onClick={() => setInspectingSubmission(null)}
+                className="px-4 py-1.5 rounded-xl border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 text-xs font-bold hover:bg-slate-100 dark:hover:bg-slate-800 transition cursor-pointer"
+              >
+                Kapat
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* INDIVIDUAL RUBRIC EVALUATION POPUP MODAL (WITH STUDENT FILES EMBEDDED) */}
+      {evaluatingStudent && (
+        <div className="fixed inset-0 z-60 flex items-center justify-center p-4 bg-slate-900/70 backdrop-blur-xs animate-in zoom-in-95">
+          <div className="w-full max-w-lg bg-white dark:bg-slate-900 rounded-3xl shadow-2xl border border-slate-200 dark:border-slate-800 p-6 space-y-4 max-h-[92vh] overflow-y-auto">
+            
+            <div className="flex items-center justify-between border-b border-slate-100 dark:border-slate-800 pb-3">
+              <div>
+                <h4 className="font-bold text-base text-slate-900 dark:text-white">
+                  Rubrik Değerlendirme: {evaluatingStudent.studentName}
+                </h4>
+                <p className="text-xs text-slate-500">#{evaluatingStudent.studentNumber} • {homework.title}</p>
+              </div>
+              <button onClick={() => setEvaluatingStudent(null)} className="text-slate-400 hover:text-slate-600 cursor-pointer">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* If student submitted video, image or note, show it here for context! */}
+            {(evaluatingStudent.submissionNote || (evaluatingStudent.attachments && evaluatingStudent.attachments.length > 0)) && (
+              <div className="p-3.5 rounded-2xl bg-purple-50/50 dark:bg-purple-950/20 border border-purple-200 dark:border-purple-800/40 space-y-2 text-xs">
+                {evaluatingStudent.submissionNote && (
+                  <div>
+                    <span className="font-bold text-purple-900 dark:text-purple-300">Öğrenci Notu: </span>
+                    <span className="text-slate-700 dark:text-slate-300">{evaluatingStudent.submissionNote}</span>
+                  </div>
+                )}
+                {evaluatingStudent.attachments && evaluatingStudent.attachments.length > 0 && (
+                  <div className="flex flex-wrap gap-1.5 items-center pt-1">
+                    <span className="font-bold text-purple-900 dark:text-purple-300">Teslim Dosyaları:</span>
+                    {evaluatingStudent.attachments.map((att, i) => (
+                      <a
+                        key={i}
+                        href={att.url}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="inline-flex items-center gap-1 px-2 py-0.5 rounded-lg bg-white dark:bg-slate-800 border border-purple-200 dark:border-purple-800 text-[11px] font-bold text-purple-700 dark:text-purple-300 hover:underline"
+                      >
+                        {att.type === 'video' ? <Video className="w-3 h-3" /> : att.type === 'image' ? <ImageIcon className="w-3 h-3" /> : <FileText className="w-3 h-3" />}
+                        {att.name}
+                      </a>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Rubric Criteria List with point sliders/selectors */}
+            <div className="space-y-3 max-h-56 overflow-y-auto">
+              {(homework.rubric || [
+                { id: 'def-1', title: 'Genel Başarı ve Doğruluk', maxPoints: 50, description: 'Ödevin gereksinimlerini karşılama düzeyi.' },
+                { id: 'def-2', title: 'Zamanlama & Özen', maxPoints: 50, description: 'Zamanında teslim ve düzen.' }
+              ]).map(r => {
+                const currentScore = rubricScores[r.id] !== undefined ? rubricScores[r.id] : r.maxPoints;
+
+                return (
+                  <div key={r.id} className="p-3 rounded-2xl bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700">
+                    <div className="flex items-center justify-between mb-1">
+                      <span className="text-xs font-bold text-slate-800 dark:text-slate-200">{r.title}</span>
+                      <span className="text-xs font-black text-indigo-600 dark:text-indigo-400">{currentScore} / {r.maxPoints} P</span>
+                    </div>
+                    {r.description && <p className="text-[10px] text-slate-400 mb-2">{r.description}</p>}
+                    
+                    <input
+                      type="range"
+                      min={0}
+                      max={r.maxPoints}
+                      value={currentScore}
+                      onChange={(e) => setRubricScores({ ...rubricScores, [r.id]: Number(e.target.value) })}
+                      className="w-full h-1.5 bg-slate-200 dark:bg-slate-700 rounded-lg appearance-none cursor-pointer accent-indigo-600"
+                    />
+                  </div>
+                );
+              })}
+            </div>
+
+            {/* Teacher Feedback textarea */}
+            <div>
+              <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-1">
+                Öğrenciye Özel Öğretmen Notu & Geri Bildirim
+              </label>
+              <textarea
+                rows={2}
+                value={teacherFeedbackText}
+                onChange={(e) => setTeacherFeedbackText(e.target.value)}
+                placeholder="Örn: Video çözümünüz incelendi, işlemler tam ve net."
+                className="w-full px-3.5 py-2 rounded-xl bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-xs text-slate-900 dark:text-slate-100 outline-none focus:ring-2 focus:ring-indigo-500"
+              />
+            </div>
+
+            <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-100 dark:border-slate-800">
+              <button
+                type="button"
+                onClick={() => setEvaluatingStudent(null)}
+                className="px-4 py-2 rounded-xl border border-slate-200 dark:border-slate-700 text-xs font-bold text-slate-600 dark:text-slate-300 cursor-pointer"
+              >
+                Vazgeç
+              </button>
+              <button
+                type="button"
+                onClick={handleSaveRubricEvaluation}
+                className="px-5 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold shadow-sm cursor-pointer"
+              >
+                Notu Kaydet & Bildir
+              </button>
+            </div>
+
+          </div>
+        </div>
+      )}
+
+      {/* FULLSCREEN MEDIA PREVIEW LIGHTBOX */}
+      {activeMediaPreview && (
+        <div 
+          className="fixed inset-0 z-70 flex items-center justify-center p-4 bg-black/85 backdrop-blur-md animate-in fade-in"
+          onClick={() => setActiveMediaPreview(null)}
+        >
+          <div 
+            className="w-full max-w-3xl bg-slate-900 rounded-3xl overflow-hidden border border-slate-800 shadow-2xl relative"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between px-5 py-3 border-b border-slate-800 bg-slate-900/90 text-white">
+              <div className="flex items-center gap-2 truncate">
+                {activeMediaPreview.type === 'video' ? (
+                  <Video className="w-4 h-4 text-purple-400 shrink-0" />
+                ) : (
+                  <ImageIcon className="w-4 h-4 text-sky-400 shrink-0" />
+                )}
+                <span className="font-bold text-sm truncate">{activeMediaPreview.name}</span>
+              </div>
+              <div className="flex items-center gap-2">
+                {activeMediaPreview.url && (
+                  <a
+                    href={activeMediaPreview.url}
+                    download={activeMediaPreview.name}
+                    className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white transition"
+                    title="İndir"
+                  >
+                    <Download className="w-4 h-4" />
+                  </a>
+                )}
+                <button 
+                  onClick={() => setActiveMediaPreview(null)}
+                  className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white transition cursor-pointer"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+            </div>
+
+            <div className="p-4 flex items-center justify-center bg-black/95 min-h-[300px] max-h-[75vh] overflow-auto">
+              {activeMediaPreview.type === 'video' || /\.(mp4|webm|mov|avi|mkv)$/i.test(activeMediaPreview.name) ? (
+                <video 
+                  src={activeMediaPreview.url} 
+                  controls 
+                  autoPlay 
+                  playsInline
+                  className="w-full max-h-[65vh] rounded-xl object-contain bg-black"
+                >
+                  Tarayıcınız video oynatmayı desteklemiyor.
+                </video>
+              ) : (
+                <img 
+                  src={activeMediaPreview.url} 
+                  alt={activeMediaPreview.name} 
+                  className="max-w-full max-h-[65vh] object-contain rounded-xl shadow-lg"
+                />
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+    </div>
+  );
+};
